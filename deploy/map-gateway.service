@@ -1,0 +1,18 @@
+[Unit]
+Description=Map Gateway tile proxy and cache
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=piboy
+Group=piboy
+WorkingDirectory=/home/piboy/projects/map-gateway
+EnvironmentFile=/home/piboy/projects/map-gateway/.env
+Environment=MAP_LISTEN_ADDR=127.0.0.1:8082
+Environment=MAP_CACHE_DIR=/home/piboy/projects/map-gateway/cache
+ExecStart=/home/piboy/projects/map-gateway/map-gateway
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

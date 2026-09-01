@@ -1,0 +1,14 @@
+# Secrets — never commit
+.env
+
+# Runtime cache (default MAP_CACHE_DIR=./cache)
+cache/
+
+# Build artifacts
+/map-gateway
+*.test
+*.out
+
+# Local backups & experimental binaries
+/map-gateway.bak.*
+/map-gateway.new
