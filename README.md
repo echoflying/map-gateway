@@ -67,7 +67,6 @@ go test ./...
 ```
 main.go                 代理与缓存实现
 docs/FALLBACK_MANUAL.md Fallback 直连容灾手册
-docs/MIGRATION_REPORT.md 迁移说明
 deploy/                 systemd 服务文件与脚本
 .env.example            环境变量模板（占位符）
 ```
