@@ -48,6 +48,55 @@ sudo systemctl enable --now map-gateway
 # 参考 deploy/add-map-gateway-location.sh
 ```
 
+## 调用方式
+
+所有路由均为 GET、相对路径（经部署主机 nginx 或直接访问监听地址），**不绑定具体域名**。前端浏览器与部署主机同源时直接使用相对路径即可。
+
+| 路由 | 用途 |
+|------|------|
+| `/health` `/healthz` | 存活探针（返回 `ok`） |
+| `/cfg/maps` | 获取天地图客户端 KEY 与三个直连上游模板（Fallback 用） |
+| `/tianditu/{vec\|cva\|img\|cia}/{z}/{x}/{y}.png` | 天地图底图瓦片 |
+| `/tile/terrain/{z}/{x}/{y}.png` | AWS Terrarium 地形高程瓦片 |
+| `/tile/sat/{z}/{x}/{y}.jpg` | ArcGIS 卫星影像瓦片 |
+
+### 示例（相对路径，同源即可用）
+
+```bash
+# 存活探针
+curl -s /health
+
+# 天地图瓦片（layer: vec/cva/img/cia，z/x/y 为瓦片坐标）
+curl -s -o vec.png /tianditu/vec/{z}/{x}/{y}.png
+
+# 地形高程瓦片
+curl -s -o terr.png /tile/terrain/{z}/{x}/{y}.png
+
+# 卫星瓦片
+curl -s -o sat.jpg /tile/sat/{z}/{x}/{y}.jpg
+
+# Fallback 配置（返回 tiandituKey + 上游模板）
+curl -s /cfg/maps
+```
+
+### 跨主机访问
+
+部署主机对外可达时，用 `<host>` 占位前缀（替换为你的域名/IP）：
+
+```bash
+curl -s https://<host>/health
+curl -s https://<host>/tianditu/vec/10/1234/567.png
+curl -s https://<host>/cfg/maps
+```
+
+> 若服务仅监听回环地址（默认 `127.0.0.1:8082`），跨主机必须经 nginx 等反代转发（见上文部署）。
+
+### 调用约束
+
+- **仅 GET**：其他方法返回 `405`（`Allow: GET`）
+- **路径严格校验**：z ≤ 2 位数字、x/y ≤ 10 位数字；**带任何查询串一律 `404`**（避免 cache-buster/注入到达缓存与上游）
+- **天地图需 KEY**：`TIANDITU_KEY` 未配置时 `/tianditu/*` 返回 `503`；`/tile/*`（terrain/sat）免 KEY 始终可用
+
 ## Fallback 直连容灾
 
 当前端检测到网关故障（连续 3 次瓦片加载失败）时，浏览器自动直连上游地图 API 保证业务延续；网关恢复后自动切回代理。完整说明见 [docs/FALLBACK_MANUAL.md](docs/FALLBACK_MANUAL.md)。
