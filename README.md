@@ -12,6 +12,7 @@
 | `/tile/terrain/{z}/{x}/{y}.png` | AWS Terrarium 高程 | 免 KEY |
 | `/tile/sat/{z}/{x}/{y}.jpg` | ArcGIS World Imagery | 免 KEY |
 | `/cfg/maps` | 下发天地图客户端 KEY 与直连模板（前端 Fallback 用） | — |
+| `/geocode/reverse?lon={经度}&lat={纬度}` | 天地图逆地理编码，返回全部可得行政层级 | 需要 `TIANDITU_KEY`（服务端持有） |
 | `/health` `/healthz` | 存活探针 | — |
 | `/admin` | 管理后台（统计 / 缓存明细） | 密码登录 |
 
@@ -50,12 +51,13 @@ sudo systemctl enable --now map-gateway
 
 ## 调用方式
 
-所有路由均为 GET、相对路径（经部署主机 nginx 或直接访问监听地址），**不绑定具体域名**。前端浏览器与部署主机同源时直接使用相对路径即可。
+统一公网入口为 `https://x.zaitu.cn/map-gateway`。不再使用其他历史域名。服务内部仍监听 `127.0.0.1:8082`。
 
 | 路由 | 用途 |
 |------|------|
 | `/health` `/healthz` | 存活探针（返回 `ok`） |
 | `/cfg/maps` | 获取天地图客户端 KEY 与三个直连上游模板（Fallback 用） |
+| `/geocode/reverse?lon={经度}&lat={纬度}` | 坐标反查完整行政区划；不接受层级参数 |
 | `/tianditu/{vec\|cva\|img\|cia}/{z}/{x}/{y}.png` | 天地图底图瓦片 |
 | `/tile/terrain/{z}/{x}/{y}.png` | AWS Terrarium 地形高程瓦片 |
 | `/tile/sat/{z}/{x}/{y}.jpg` | ArcGIS 卫星影像瓦片 |
@@ -64,32 +66,25 @@ sudo systemctl enable --now map-gateway
 
 ```bash
 # 存活探针
-curl -s /health
+curl -s https://x.zaitu.cn/map-gateway/health
 
 # 天地图瓦片（layer: vec/cva/img/cia，z/x/y 为瓦片坐标）
-curl -s -o vec.png /tianditu/vec/{z}/{x}/{y}.png
+curl -s -o vec.png https://x.zaitu.cn/map-gateway/tianditu/vec/{z}/{x}/{y}.png
 
 # 地形高程瓦片
-curl -s -o terr.png /tile/terrain/{z}/{x}/{y}.png
+curl -s -o terr.png https://x.zaitu.cn/map-gateway/tile/terrain/{z}/{x}/{y}.png
 
 # 卫星瓦片
-curl -s -o sat.jpg /tile/sat/{z}/{x}/{y}.jpg
+curl -s -o sat.jpg https://x.zaitu.cn/map-gateway/tile/sat/{z}/{x}/{y}.jpg
 
 # Fallback 配置（返回 tiandituKey + 上游模板）
-curl -s /cfg/maps
+curl -s https://x.zaitu.cn/map-gateway/cfg/maps
+
+# 逆地理编码：一次返回全部可得层级
+curl -s 'https://x.zaitu.cn/map-gateway/geocode/reverse?lon=103.8343&lat=30.0508'
 ```
 
-### 跨主机访问
-
-部署主机对外可达时，用 `<host>` 占位前缀（替换为你的域名/IP）：
-
-```bash
-curl -s https://<host>/health
-curl -s https://<host>/tianditu/vec/10/1234/567.png
-curl -s https://<host>/cfg/maps
-```
-
-> 若服务仅监听回环地址（默认 `127.0.0.1:8082`），跨主机必须经 nginx 等反代转发（见上文部署）。
+逆地理编码的完整契约、直辖市规则和降级语义见 [docs/REVERSE_GEOCODING.md](docs/REVERSE_GEOCODING.md)。
 
 ### 调用约束
 
@@ -102,7 +97,7 @@ curl -s https://<host>/cfg/maps
 当前端检测到网关故障（连续 3 次瓦片加载失败）时，浏览器自动直连上游地图 API 保证业务延续；网关恢复后自动切回代理。完整说明见 [docs/FALLBACK_MANUAL.md](docs/FALLBACK_MANUAL.md)。
 
 ```bash
-curl -s https://<host>/cfg/maps   # 应有 tiandituKey 与三个上游模板
+curl -s https://x.zaitu.cn/map-gateway/cfg/maps   # 应有 tiandituKey 与三个上游模板
 ```
 
 ## 测试
@@ -116,6 +111,7 @@ go test ./...
 ```
 main.go                 代理与缓存实现
 docs/FALLBACK_MANUAL.md Fallback 直连容灾手册
+docs/REVERSE_GEOCODING.md 逆地理编码接口契约
 deploy/                 systemd 服务文件与脚本
 .env.example            环境变量模板（占位符）
 ```

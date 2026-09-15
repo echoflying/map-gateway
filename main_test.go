@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,20 @@ import (
 	"testing"
 	"time"
 )
+
+func geocoderStub(t *testing.T, response string, status int, inspect func(*http.Request)) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if inspect != nil {
+			inspect(r)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		fmt.Fprint(w, response)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -94,6 +109,73 @@ func TestMethodNotAllowed(t *testing.T) {
 	}
 	if rec.Header().Get("Allow") != "GET" {
 		t.Fatalf("Allow header: %q", rec.Header().Get("Allow"))
+	}
+}
+
+func TestReverseGeocodeReturnsAllLevels(t *testing.T) {
+	up := geocoderStub(t, `{"status":"0","msg":"ok","result":{"formatted_address":"四川省眉山市东坡区苏祠街道","addressComponent":{"nation":"中国","province":"四川省","province_code":"156510000","city":"眉山市","city_code":"156511400","county":"东坡区","county_code":"156511402","town":"苏祠街道","town_code":"156511402003"}}}`, http.StatusOK, func(r *http.Request) {
+		if r.URL.Query().Get("tk") != "test-key" || r.URL.Query().Get("type") != "geocode" {
+			t.Errorf("unexpected upstream query: %s", r.URL.RawQuery)
+		}
+		if !strings.Contains(r.URL.Query().Get("postStr"), `"lon":103.8343`) {
+			t.Errorf("unexpected postStr: %s", r.URL.Query().Get("postStr"))
+		}
+	})
+	g, _ := newTestGateway(t, func(c *config) { c.GeocoderUpstream = up.URL })
+	rec := doGET(t, g, "/geocode/reverse?lon=103.8343&lat=30.0508", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got reverseGeocodeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Administrative.Province.Name != "四川省" || got.Administrative.City.Name != "眉山市" || got.Administrative.County.Name != "东坡区" || got.Administrative.Town.Name != "苏祠街道" {
+		t.Fatalf("unexpected hierarchy: %+v", got.Administrative)
+	}
+	if got.Administrative.Village.Name != "" || got.Municipality {
+		t.Fatalf("unexpected village/municipality: %+v", got)
+	}
+}
+
+func TestReverseGeocodeMunicipality(t *testing.T) {
+	up := geocoderStub(t, `{"status":"0","result":{"formatted_address":"北京市东城区东华门街道","addressComponent":{"nation":"中国","province":"北京市","province_code":"156110000","city":"","city_code":"","county":"东城区","county_code":"156110101","town":"东华门街道","town_code":"156110101001"}}}`, http.StatusOK, nil)
+	g, _ := newTestGateway(t, func(c *config) { c.GeocoderUpstream = up.URL })
+	rec := doGET(t, g, "/geocode/reverse?lon=116.3974&lat=39.9093", nil)
+	var got reverseGeocodeResponse
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &got) != nil {
+		t.Fatalf("got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !got.Municipality || got.Administrative.City.Name != "" || got.Administrative.County.Name != "东城区" {
+		t.Fatalf("unexpected municipality result: %+v", got)
+	}
+}
+
+func TestMunicipalityIsNotInferredFromMissingCity(t *testing.T) {
+	if !isMunicipality("重庆市") || isMunicipality("海南省") {
+		t.Fatal("municipality must be based on the four municipality names")
+	}
+}
+
+func TestReverseGeocodeValidationAndFailures(t *testing.T) {
+	g, _ := newTestGateway(t, nil)
+	for _, path := range []string{
+		"/geocode/reverse", "/geocode/reverse?lon=181&lat=30", "/geocode/reverse?lon=1&lat=NaN",
+		"/geocode/reverse?lon=1&lat=2&level=town", "/geocode/reverse?lon=1&lon=2&lat=3",
+	} {
+		if rec := doGET(t, g, path, nil); rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: got %d, want 400", path, rec.Code)
+		}
+	}
+
+	noKey, _ := newTestGateway(t, func(c *config) { c.TiandituKey = "" })
+	if rec := doGET(t, noKey, "/geocode/reverse?lon=1&lat=2", nil); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("missing key: got %d", rec.Code)
+	}
+	up := geocoderStub(t, `{"status":"1","msg":"no result"}`, http.StatusOK, nil)
+	bad, _ := newTestGateway(t, func(c *config) { c.GeocoderUpstream = up.URL })
+	if rec := doGET(t, bad, "/geocode/reverse?lon=1&lat=2", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("no result: got %d", rec.Code)
 	}
 }
 

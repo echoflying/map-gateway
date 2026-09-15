@@ -6,6 +6,7 @@
 // Routes (GET only, browser-compatible):
 //
 //	/health, /healthz                          -> "ok" (systemd / probes)
+//	/geocode/reverse?lon={lon}&lat={lat}        -> Tianditu reverse geocoding
 //	/tile/terrain/{z}/{x}/{y}.png              -> AWS Terrarium elevation tiles
 //	/tile/sat/{z}/{x}/{y}.jpg|.png             -> ArcGIS World_Imagery
 //	/tianditu/{vec|cva|img|cia}/{z}/{x}/{y}.png -> Tianditu WMTS (needs TIANDITU_KEY)
@@ -38,8 +39,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -84,6 +87,7 @@ const (
 	satUpstream = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/%s/%s/%s"
 	// Tianditu WMTS; tk=<TIANDITU_KEY> is appended server-side only.
 	tiandituUpstream = "https://t%d.tianditu.gov.cn/%s_w/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=%s&STYLE=default&TILEMATRIXSET=w&FORMAT=tiles&TILEMATRIX=%s&TILEROW=%s&TILECOL=%s&tk=%s"
+	geocoderUpstream = "https://api.tianditu.gov.cn/geocoder"
 )
 
 // Strictly numeric, length-bounded path components: z up to 2 digits,
@@ -114,6 +118,7 @@ type config struct {
 	TerrainUpstream  string
 	SatUpstream      string
 	TiandituUpstream string
+	GeocoderUpstream string
 }
 
 func defaultConfig() config {
@@ -131,6 +136,7 @@ func defaultConfig() config {
 		TerrainUpstream:  terrainUpstream,
 		SatUpstream:      satUpstream,
 		TiandituUpstream: tiandituUpstream,
+		GeocoderUpstream: geocoderUpstream,
 	}
 }
 
@@ -186,6 +192,7 @@ func configFromEnv() config {
 	cfg.TerrainUpstream = firstNonEmpty(get("MAP_TERRAIN_UPSTREAM"), cfg.TerrainUpstream)
 	cfg.SatUpstream = firstNonEmpty(get("MAP_SAT_UPSTREAM"), cfg.SatUpstream)
 	cfg.TiandituUpstream = firstNonEmpty(get("MAP_TIANDITU_UPSTREAM"), cfg.TiandituUpstream)
+	cfg.GeocoderUpstream = firstNonEmpty(get("MAP_GEOCODER_UPSTREAM"), cfg.GeocoderUpstream)
 	return cfg
 }
 
@@ -400,6 +407,8 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(rec, "ok")
 	case path == "/cfg/maps":
 		g.handleMapConfig(rec, r)
+	case path == "/geocode/reverse":
+		g.handleReverseGeocode(rec, r)
 	case strings.HasPrefix(path, "/tile/"):
 		g.handleTile(rec, r)
 	case strings.HasPrefix(path, "/tianditu/"):
@@ -408,7 +417,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(rec, r)
 	}
 	// Admin routes are recorded inside their handlers; tiles are recorded here.
-	if strings.HasPrefix(path, "/tile/") || strings.HasPrefix(path, "/tianditu/") {
+	if strings.HasPrefix(path, "/tile/") || strings.HasPrefix(path, "/tianditu/") || path == "/geocode/reverse" {
 		g.recordRequest(path, rec.status, rec.written, time.Since(start), "", r.Header.Get("Referer"))
 	}
 done:
@@ -416,6 +425,146 @@ done:
 	if !strings.HasPrefix(path, "/admin") {
 		log.Printf("%s %s -> %d (%dB) %s", r.Method, path, rec.status, rec.written,
 			time.Since(start).Round(time.Millisecond))
+	}
+}
+
+type administrativeDivision struct {
+	Name string `json:"name"`
+	Code string `json:"code"`
+}
+
+type reverseGeocodeResponse struct {
+	Location struct {
+		Lon float64 `json:"lon"`
+		Lat float64 `json:"lat"`
+	} `json:"location"`
+	FormattedAddress string `json:"formattedAddress"`
+	Administrative   struct {
+		Country  administrativeDivision `json:"country"`
+		Province administrativeDivision `json:"province"`
+		City     administrativeDivision `json:"city"`
+		County   administrativeDivision `json:"county"`
+		Town     administrativeDivision `json:"town"`
+		Village  administrativeDivision `json:"village"`
+	} `json:"administrative"`
+	Municipality bool   `json:"municipality"`
+	Source       string `json:"source"`
+}
+
+type tiandituGeocoderResponse struct {
+	Status string `json:"status"`
+	Msg    string `json:"msg"`
+	Result struct {
+		FormattedAddress string `json:"formatted_address"`
+		AddressComponent struct {
+			Nation       string `json:"nation"`
+			Province     string `json:"province"`
+			ProvinceCode string `json:"province_code"`
+			City         string `json:"city"`
+			CityCode     string `json:"city_code"`
+			County       string `json:"county"`
+			CountyCode   string `json:"county_code"`
+			Town         string `json:"town"`
+			TownCode     string `json:"town_code"`
+		} `json:"addressComponent"`
+	} `json:"result"`
+}
+
+// handleReverseGeocode returns every administrative level available from one
+// lookup. Callers decide which level they need; there is deliberately no level
+// request parameter. Tianditu currently has no stable structured village field,
+// so village is retained in our contract and returned empty until such a source
+// is available.
+func (g *gateway) handleReverseGeocode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !g.tileRateAllow(r) {
+		g.rateLimited.Add(1)
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+	if g.cfg.TiandituKey == "" {
+		http.Error(w, "tianditu key not configured", http.StatusServiceUnavailable)
+		return
+	}
+	q := r.URL.Query()
+	if len(q) != 2 || len(q["lon"]) != 1 || len(q["lat"]) != 1 {
+		http.Error(w, "exactly lon and lat are required", http.StatusBadRequest)
+		return
+	}
+	lon, errLon := strconv.ParseFloat(q.Get("lon"), 64)
+	lat, errLat := strconv.ParseFloat(q.Get("lat"), 64)
+	if errLon != nil || errLat != nil || math.IsNaN(lon) || math.IsNaN(lat) || math.IsInf(lon, 0) || math.IsInf(lat, 0) || lon < -180 || lon > 180 || lat < -90 || lat > 90 {
+		http.Error(w, "invalid lon or lat", http.StatusBadRequest)
+		return
+	}
+
+	postStr, _ := json.Marshal(map[string]interface{}{"lon": lon, "lat": lat, "ver": 1})
+	upstream, err := url.Parse(g.cfg.GeocoderUpstream)
+	if err != nil {
+		http.Error(w, "geocoder unavailable", http.StatusBadGateway)
+		return
+	}
+	params := upstream.Query()
+	params.Set("postStr", string(postStr))
+	params.Set("type", "geocode")
+	params.Set("tk", g.cfg.TiandituKey)
+	upstream.RawQuery = params.Encode()
+
+	g.endpointUpstream("geocode/reverse")
+	resp, err := g.client.Get(upstream.String())
+	if err != nil {
+		g.upstreamErr.Add(1)
+		log.Printf("geocoder upstream: %s", g.redact(err.Error()))
+		http.Error(w, "geocoder unavailable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		g.upstreamErr.Add(1)
+		log.Printf("geocoder upstream status %d", resp.StatusCode)
+		http.Error(w, "geocoder unavailable", http.StatusBadGateway)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	if err != nil || len(body) > 1<<20 {
+		g.upstreamErr.Add(1)
+		http.Error(w, "invalid geocoder response", http.StatusBadGateway)
+		return
+	}
+	var raw tiandituGeocoderResponse
+	if json.Unmarshal(body, &raw) != nil || raw.Status != "0" {
+		g.upstreamErr.Add(1)
+		http.Error(w, "geocoder returned no result", http.StatusNotFound)
+		return
+	}
+
+	ac := raw.Result.AddressComponent
+	var out reverseGeocodeResponse
+	out.Location.Lon, out.Location.Lat = lon, lat
+	out.FormattedAddress = raw.Result.FormattedAddress
+	out.Administrative.Country = administrativeDivision{Name: ac.Nation}
+	out.Administrative.Province = administrativeDivision{Name: ac.Province, Code: ac.ProvinceCode}
+	out.Administrative.City = administrativeDivision{Name: ac.City, Code: ac.CityCode}
+	out.Administrative.County = administrativeDivision{Name: ac.County, Code: ac.CountyCode}
+	out.Administrative.Town = administrativeDivision{Name: ac.Town, Code: ac.TownCode}
+	out.Municipality = isMunicipality(ac.Province)
+	out.Source = "tianditu"
+	g.upstreamOK.Add(1)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	json.NewEncoder(w).Encode(out)
+}
+
+func isMunicipality(province string) bool {
+	switch province {
+	case "北京市", "上海市", "天津市", "重庆市":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -853,7 +1002,7 @@ func appFor(referer string) string {
 		return "KMLGuru"
 	case strings.Contains(r, "3dkml") || strings.Contains(r, "kml3d"):
 		return "KML3D"
-	case strings.Contains(r, "piboy.xyz") || strings.Contains(r, "piboy.ccwu.cc"):
+	case strings.Contains(r, "x.zaitu.cn"):
 		return "本站页面"
 	default:
 		return "其他"
@@ -875,6 +1024,8 @@ func endpointFor(path string) string {
 		return "tianditu/img"
 	case strings.HasPrefix(path, "/tianditu/cia/"):
 		return "tianditu/cia"
+	case path == "/geocode/reverse":
+		return "geocode/reverse"
 	default:
 		return "other"
 	}

@@ -171,7 +171,7 @@ sudo systemctl start map-gateway
 sudo nginx -t && sudo systemctl reload nginx
 
 # 4. 验证
-curl -s https://<host>/cfg/maps
+curl -s https://x.zaitu.cn/map-gateway/cfg/maps
 ```
 
 一键脚本：`~/projects/sysadmin/deploy-map-fallback.sh`（会自动完成以上步骤）。

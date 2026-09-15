@@ -1,9 +1,9 @@
 #!/bin/bash
-# 为 map-gateway 后台加 /map-gateway/ 前缀公网入口（piboy.ccwu.cc）
+# 为 map-gateway 加 x.zaitu.cn/map-gateway/ 统一公网入口
 #   sudo bash ~/projects/map-gateway/deploy/add-map-gateway-location.sh
 set -euo pipefail
 
-NGX=/etc/nginx/sites-available/piboy
+NGX=/etc/nginx/conf.d/x-zaitu-kml3d-https.conf
 
 [ -f "$NGX" ] || { echo "缺少 $NGX"; exit 1; }
 
@@ -55,9 +55,9 @@ fi
 
 echo "===== 3/3 验证 ====="
 for p in /map-gateway/admin /map-gateway/health; do
-  code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: piboy.ccwu.cc' "http://127.0.0.1$p")
-  echo "  piboy.ccwu.cc$p → HTTP $code"
+  code=$(curl -k -s -o /dev/null -w '%{http_code}' "https://x.zaitu.cn$p")
+  echo "  x.zaitu.cn$p → HTTP $code"
 done
-curl -s -H 'Host: piboy.ccwu.cc' http://127.0.0.1/map-gateway/admin | grep -o '<title>[^<]*</title>' || true
+curl -k -s https://x.zaitu.cn/map-gateway/health || true
 
 echo "===== 完成 ====="
