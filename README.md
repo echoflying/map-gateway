@@ -20,6 +20,7 @@
 - 按 IP 频控（默认 600 次/分钟），返回 `429`
 - 路径严格正则校验（z≤2 位、x/y≤10 位数字），拒绝一切非瓦片路径
 - 上游超时 / 超大瓦片防护，异常返回 `502`
+- 逆地理编码结果由内置四级行政区划目录校验并规范化，可作为下游持久化的权威值
 - 所有凭据仅从环境变量读取，**不写日志、不经 HTTP 暴露**（唯一例外：`/cfg/maps` 返回天地图客户端 KEY——天地图 tk 本就是浏览器端 key，供直连容灾）
 
 ## 快速开始
@@ -112,6 +113,7 @@ go test ./...
 main.go                 代理与缓存实现
 docs/FALLBACK_MANUAL.md Fallback 直连容灾手册
 docs/REVERSE_GEOCODING.md 逆地理编码接口契约
+data/admin-divisions.tsv 中国省/市/区县/乡镇街道四级权威目录
 deploy/                 systemd 服务文件与脚本
 .env.example            环境变量模板（占位符）
 ```

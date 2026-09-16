@@ -35,8 +35,24 @@ func geocoderStub(t *testing.T, response string, status int, inspect func(*http.
 func newTestGateway(t *testing.T, mutate func(*config)) (*gateway, string) {
 	t.Helper()
 	cacheDir := t.TempDir()
+	adminFile := filepath.Join(t.TempDir(), "admin-divisions.tsv")
+	adminData := strings.Join([]string{
+		"510000\t四川省\t1\t",
+		"511400\t眉山市\t2\t510000",
+		"511402\t东坡区\t3\t511400",
+		"511402003\t苏祠街道\t4\t511402",
+		"110000\t北京市\t1\t",
+		"110100\t北京市\t2\t110000",
+		"110101\t东城区\t3\t110100",
+		"110101001\t东华门街道\t4\t110101",
+	}, "\n") + "\n"
+	if err := os.WriteFile(adminFile, []byte(adminData), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cfg := defaultConfig()
 	cfg.CacheDir = cacheDir
+	cfg.AdminDivisionsFile = adminFile
+	cfg.AdminDivisionsSHA256 = ""
 	cfg.TiandituKey = "test-key"
 	cfg.TileRate = 1000 // off by default for most tests
 	if mutate != nil {
@@ -133,7 +149,13 @@ func TestReverseGeocodeReturnsAllLevels(t *testing.T) {
 	if got.Administrative.Province.Name != "四川省" || got.Administrative.City.Name != "眉山市" || got.Administrative.County.Name != "东坡区" || got.Administrative.Town.Name != "苏祠街道" {
 		t.Fatalf("unexpected hierarchy: %+v", got.Administrative)
 	}
-	if got.Administrative.Village.Name != "" || got.Municipality {
+	if got.SchemaVersion != "1.0" || got.Authority.Provider != "map-gateway" || got.Authority.CodeSystem != "china-national-geonames-level4+tianditu-prefix" {
+		t.Fatalf("unexpected contract metadata: %+v", got)
+	}
+	if got.ResolvedLevel != "town" || !got.Administrative.Town.Available || got.Administrative.Town.Level != "town" {
+		t.Fatalf("unexpected resolution: %+v", got)
+	}
+	if got.Administrative.Village.Available || got.Administrative.Village.Level != "village" || got.Administrative.Village.Name != "" || got.Administrative.Village.Code != "" || got.Municipality {
 		t.Fatalf("unexpected village/municipality: %+v", got)
 	}
 }
@@ -146,7 +168,7 @@ func TestReverseGeocodeMunicipality(t *testing.T) {
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &got) != nil {
 		t.Fatalf("got %d: %s", rec.Code, rec.Body.String())
 	}
-	if !got.Municipality || got.Administrative.City.Name != "" || got.Administrative.County.Name != "东城区" {
+	if !got.Municipality || got.Administrative.City.Available || got.Administrative.City.Level != "city" || got.Administrative.City.Name != "" || got.Administrative.City.Code != "" || got.Administrative.County.Name != "东城区" {
 		t.Fatalf("unexpected municipality result: %+v", got)
 	}
 }
@@ -176,6 +198,81 @@ func TestReverseGeocodeValidationAndFailures(t *testing.T) {
 	bad, _ := newTestGateway(t, func(c *config) { c.GeocoderUpstream = up.URL })
 	if rec := doGET(t, bad, "/geocode/reverse?lon=1&lat=2", nil); rec.Code != http.StatusNotFound {
 		t.Fatalf("no result: got %d", rec.Code)
+	}
+}
+
+func TestReverseGeocodeRejectsUntrustworthyAdministrativeData(t *testing.T) {
+	tests := []string{
+		`{"status":"0","result":{"addressComponent":{"nation":"中国","province":"四川省","province_code":"156510000","county":"东坡区","county_code":"","town":"苏祠街道","town_code":"156511402003"}}}`,
+		`{"status":"0","result":{"addressComponent":{"nation":"中国","province":"四川省","province_code":"156510000","county":"东坡区","county_code":"156330105"}}}`,
+		`{"status":"0","result":{"addressComponent":{"nation":"中国","province":"四川省","province_code":"156510000","county":"东坡区","county_code":"156511402","town":"苏祠街道","town_code":"156330105012"}}}`,
+	}
+	for i, body := range tests {
+		up := geocoderStub(t, body, http.StatusOK, nil)
+		g, _ := newTestGateway(t, func(c *config) { c.GeocoderUpstream = up.URL })
+		if rec := doGET(t, g, "/geocode/reverse?lon=103.8343&lat=30.0508", nil); rec.Code != http.StatusBadGateway {
+			t.Errorf("case %d: got %d: %s", i, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestAdministrativeDivisionContract(t *testing.T) {
+	empty, err := makeAdministrativeDivision("town", "", "", 12)
+	if err != nil || empty.Available || empty.Level != "town" || empty.Name != "" || empty.Code != "" {
+		t.Fatalf("unexpected empty level: %+v, %v", empty, err)
+	}
+	if _, err := makeAdministrativeDivision("town", "苏祠街道", "", 12); err == nil {
+		t.Fatal("name without code must be rejected")
+	}
+	if _, err := makeAdministrativeDivision("county", "东坡区", "511402", 9); err == nil {
+		t.Fatal("non-Tianditu code length must be rejected")
+	}
+}
+
+func TestAdministrativeCatalogIsCanonicalAuthority(t *testing.T) {
+	up := geocoderStub(t, `{"status":"0","result":{"addressComponent":{"nation":"中国","province":"四川","province_code":"156510000","city":"眉山","city_code":"156511400","county":"旧东坡名称","county_code":"156511402","town":"旧苏祠名称","town_code":"156511402003"}}}`, http.StatusOK, nil)
+	g, _ := newTestGateway(t, func(c *config) { c.GeocoderUpstream = up.URL })
+	rec := doGET(t, g, "/geocode/reverse?lon=103.8343&lat=30.0508", nil)
+	var got reverseGeocodeResponse
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &got) != nil {
+		t.Fatalf("got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got.Administrative.Province.Name != "四川省" || got.Administrative.County.Name != "东坡区" || got.Administrative.Town.Name != "苏祠街道" {
+		t.Fatalf("catalog names were not canonical: %+v", got.Administrative)
+	}
+}
+
+func TestReverseGeocodeConsistentEmptyTown(t *testing.T) {
+	up := geocoderStub(t, `{"status":"0","result":{"addressComponent":{"nation":"中国","province":"四川省","province_code":"156510000","city":"眉山市","city_code":"156511400","county":"东坡区","county_code":"156511402","town":"","town_code":""}}}`, http.StatusOK, nil)
+	g, _ := newTestGateway(t, func(c *config) { c.GeocoderUpstream = up.URL })
+	rec := doGET(t, g, "/geocode/reverse?lon=103.8343&lat=30.0508", nil)
+	var got reverseGeocodeResponse
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &got) != nil {
+		t.Fatalf("got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got.ResolvedLevel != "county" || got.Administrative.Town.Available || got.Administrative.Town.Level != "town" || got.Administrative.Town.Name != "" || got.Administrative.Town.Code != "" {
+		t.Fatalf("unexpected empty town contract: %+v", got)
+	}
+}
+
+func TestAdministrativeCatalogUnavailable(t *testing.T) {
+	g, _ := newTestGateway(t, func(c *config) { c.AdminDivisionsFile = filepath.Join(t.TempDir(), "missing.tsv") })
+	rec := doGET(t, g, "/geocode/reverse?lon=103.8343&lat=30.0508", nil)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("got %d, want 503", rec.Code)
+	}
+}
+
+func TestLoadAdminDivisionsValidatesChecksumAndParents(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "catalog.tsv")
+	if err := os.WriteFile(p, []byte("510000\t四川省\t1\t\n511400\t眉山市\t2\t999999\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadAdminDivisions(p, "bad-checksum"); err == nil {
+		t.Fatal("checksum mismatch must fail")
+	}
+	if _, err := loadAdminDivisions(p, ""); err == nil {
+		t.Fatal("orphan parent must fail")
 	}
 }
 

@@ -32,6 +32,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -67,6 +68,8 @@ const (
 	defaultTileRate        = 600 // per IP per minute, shared across tile endpoints
 	defaultUpstreamTimeout = 45 * time.Second
 	defaultMaxTileBytes    = 8 << 20 // 8 MiB per tile, guards against runaway upstreams
+	defaultAdminDivisions  = "data/admin-divisions.tsv"
+	adminDivisionsSHA256   = "b7e7570618b24bfc542ada6d64c6550e8453626d640cc4236092bbea35048267"
 	maxZoom                = 30
 
 	// Admin dashboard login (fixed credential, password-only check).
@@ -95,6 +98,7 @@ const (
 var (
 	tileURLRe     = regexp.MustCompile(`^/tile/(terrain|sat)/([0-9]{1,2})/([0-9]{1,10})/([0-9]{1,10})\.(png|jpg)$`)
 	tiandituURLRe = regexp.MustCompile(`^/tianditu/(vec|cva|img|cia)/([0-9]{1,2})/([0-9]{1,10})/([0-9]{1,10})\.png$`)
+	adminCodeRe   = regexp.MustCompile(`^[0-9]+$`)
 )
 
 // ---------------------------------------------------------------------------
@@ -102,15 +106,17 @@ var (
 // ---------------------------------------------------------------------------
 
 type config struct {
-	ListenAddr      string
-	CacheDir        string
-	CacheMax        int64
-	EvictWatermark  float64
-	TileRate        int
-	UpstreamTimeout time.Duration
-	MaxTileBytes    int64
-	TiandituKey     string
-	EnvFile         string
+	ListenAddr           string
+	CacheDir             string
+	CacheMax             int64
+	EvictWatermark       float64
+	TileRate             int
+	UpstreamTimeout      time.Duration
+	MaxTileBytes         int64
+	TiandituKey          string
+	EnvFile              string
+	AdminDivisionsFile   string
+	AdminDivisionsSHA256 string
 	// Admin dashboard (fixed credential).
 	AdminUser string
 	AdminPass string
@@ -123,20 +129,22 @@ type config struct {
 
 func defaultConfig() config {
 	return config{
-		ListenAddr:       defaultListenAddr,
-		CacheDir:         "cache",
-		CacheMax:         int64(defaultCacheMaxMB) << 20,
-		EvictWatermark:   defaultEvictWatermark,
-		TileRate:         defaultTileRate,
-		UpstreamTimeout:  defaultUpstreamTimeout,
-		MaxTileBytes:     defaultMaxTileBytes,
-		EnvFile:          ".env",
-		AdminUser:        defaultAdminUser,
-		AdminPass:        defaultAdminPass,
-		TerrainUpstream:  terrainUpstream,
-		SatUpstream:      satUpstream,
-		TiandituUpstream: tiandituUpstream,
-		GeocoderUpstream: geocoderUpstream,
+		ListenAddr:           defaultListenAddr,
+		CacheDir:             "cache",
+		CacheMax:             int64(defaultCacheMaxMB) << 20,
+		EvictWatermark:       defaultEvictWatermark,
+		TileRate:             defaultTileRate,
+		UpstreamTimeout:      defaultUpstreamTimeout,
+		MaxTileBytes:         defaultMaxTileBytes,
+		EnvFile:              ".env",
+		AdminDivisionsFile:   defaultAdminDivisions,
+		AdminDivisionsSHA256: adminDivisionsSHA256,
+		AdminUser:            defaultAdminUser,
+		AdminPass:            defaultAdminPass,
+		TerrainUpstream:      terrainUpstream,
+		SatUpstream:          satUpstream,
+		TiandituUpstream:     tiandituUpstream,
+		GeocoderUpstream:     geocoderUpstream,
 	}
 }
 
@@ -161,6 +169,7 @@ func configFromEnv() config {
 	cfg.ListenAddr = firstNonEmpty(get("MAP_LISTEN_ADDR"), cfg.ListenAddr)
 	cfg.CacheDir = firstNonEmpty(get("MAP_CACHE_DIR"), cfg.CacheDir)
 	cfg.TiandituKey = get("TIANDITU_KEY")
+	cfg.AdminDivisionsFile = firstNonEmpty(get("MAP_ADMIN_DIVISIONS_FILE"), cfg.AdminDivisionsFile)
 	cfg.AdminUser = firstNonEmpty(get("MAP_ADMIN_USER"), cfg.AdminUser)
 	cfg.AdminPass = firstNonEmpty(get("MAP_ADMIN_PASS"), cfg.AdminPass)
 	if v := get("MAP_CACHE_MAX_MB"); v != "" {
@@ -285,8 +294,10 @@ type failRec struct {
 }
 
 type gateway struct {
-	cfg    config
-	client *http.Client
+	cfg               config
+	client            *http.Client
+	adminDivisions    map[string]adminDivisionRecord
+	adminDivisionsErr error
 
 	cacheMu   sync.Mutex
 	cacheSize int64
@@ -321,16 +332,22 @@ type gateway struct {
 }
 
 func newGateway(cfg config) *gateway {
+	adminDivisions, adminDivisionsErr := loadAdminDivisions(cfg.AdminDivisionsFile, cfg.AdminDivisionsSHA256)
 	g := &gateway{
-		cfg:        cfg,
-		client:     &http.Client{Timeout: cfg.UpstreamTimeout},
-		rlCounts:   map[string]*rlRec{},
-		fetchLocks: map[string]*sync.Mutex{},
-		statsStart: time.Now(),
-		byEndpoint: map[string]*epStat{},
-		byApp:      map[string]*epStat{},
-		sessions:   map[string]adminSession{},
-		fails:      map[string]failRec{},
+		cfg:               cfg,
+		client:            &http.Client{Timeout: cfg.UpstreamTimeout},
+		adminDivisions:    adminDivisions,
+		adminDivisionsErr: adminDivisionsErr,
+		rlCounts:          map[string]*rlRec{},
+		fetchLocks:        map[string]*sync.Mutex{},
+		statsStart:        time.Now(),
+		byEndpoint:        map[string]*epStat{},
+		byApp:             map[string]*epStat{},
+		sessions:          map[string]adminSession{},
+		fails:             map[string]failRec{},
+	}
+	if adminDivisionsErr != nil {
+		log.Printf("administrative catalog unavailable: %v", adminDivisionsErr)
 	}
 	if err := os.MkdirAll(cfg.CacheDir, 0o755); err != nil {
 		log.Printf("cache dir %s: %v", cfg.CacheDir, err)
@@ -429,11 +446,25 @@ done:
 }
 
 type administrativeDivision struct {
-	Name string `json:"name"`
-	Code string `json:"code"`
+	Level     string `json:"level"`
+	Available bool   `json:"available"`
+	Name      string `json:"name"`
+	Code      string `json:"code"`
+}
+
+type adminDivisionRecord struct {
+	Code   string
+	Name   string
+	Level  int
+	Parent string
 }
 
 type reverseGeocodeResponse struct {
+	SchemaVersion string `json:"schemaVersion"`
+	Authority     struct {
+		Provider   string `json:"provider"`
+		CodeSystem string `json:"codeSystem"`
+	} `json:"authority"`
 	Location struct {
 		Lon float64 `json:"lon"`
 		Lat float64 `json:"lat"`
@@ -447,8 +478,9 @@ type reverseGeocodeResponse struct {
 		Town     administrativeDivision `json:"town"`
 		Village  administrativeDivision `json:"village"`
 	} `json:"administrative"`
-	Municipality bool   `json:"municipality"`
-	Source       string `json:"source"`
+	ResolvedLevel string `json:"resolvedLevel"`
+	Municipality  bool   `json:"municipality"`
+	Source        string `json:"source"`
 }
 
 type tiandituGeocoderResponse struct {
@@ -488,6 +520,10 @@ func (g *gateway) handleReverseGeocode(w http.ResponseWriter, r *http.Request) {
 	}
 	if g.cfg.TiandituKey == "" {
 		http.Error(w, "tianditu key not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if g.adminDivisionsErr != nil {
+		http.Error(w, "administrative catalog unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	q := r.URL.Query()
@@ -543,20 +579,185 @@ func (g *gateway) handleReverseGeocode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ac := raw.Result.AddressComponent
+	country, err := makeAdministrativeDivision("country", ac.Nation, "156", 3)
+	if err != nil {
+		g.upstreamErr.Add(1)
+		http.Error(w, "incomplete geocoder response", http.StatusBadGateway)
+		return
+	}
+	province, err := g.catalogAdministrativeDivision("province", ac.Province, ac.ProvinceCode, 1)
+	if err != nil {
+		g.upstreamErr.Add(1)
+		http.Error(w, "incomplete geocoder response", http.StatusBadGateway)
+		return
+	}
+	city, err := g.catalogAdministrativeDivision("city", ac.City, ac.CityCode, 2)
+	if err != nil {
+		g.upstreamErr.Add(1)
+		http.Error(w, "incomplete geocoder response", http.StatusBadGateway)
+		return
+	}
+	county, err := g.catalogAdministrativeDivision("county", ac.County, ac.CountyCode, 3)
+	if err != nil {
+		g.upstreamErr.Add(1)
+		http.Error(w, "incomplete geocoder response", http.StatusBadGateway)
+		return
+	}
+	town, err := g.catalogAdministrativeDivision("town", ac.Town, ac.TownCode, 4)
+	if err != nil || !province.Available || !county.Available || !g.validCatalogHierarchy(province, city, county, town) {
+		g.upstreamErr.Add(1)
+		http.Error(w, "incomplete geocoder response", http.StatusBadGateway)
+		return
+	}
+	village, _ := makeAdministrativeDivision("village", "", "", 0)
+
 	var out reverseGeocodeResponse
+	out.SchemaVersion = "1.0"
+	out.Authority.Provider = "map-gateway"
+	out.Authority.CodeSystem = "china-national-geonames-level4+tianditu-prefix"
 	out.Location.Lon, out.Location.Lat = lon, lat
 	out.FormattedAddress = raw.Result.FormattedAddress
-	out.Administrative.Country = administrativeDivision{Name: ac.Nation}
-	out.Administrative.Province = administrativeDivision{Name: ac.Province, Code: ac.ProvinceCode}
-	out.Administrative.City = administrativeDivision{Name: ac.City, Code: ac.CityCode}
-	out.Administrative.County = administrativeDivision{Name: ac.County, Code: ac.CountyCode}
-	out.Administrative.Town = administrativeDivision{Name: ac.Town, Code: ac.TownCode}
+	out.Administrative.Country = country
+	out.Administrative.Province = province
+	out.Administrative.City = city
+	out.Administrative.County = county
+	out.Administrative.Town = town
+	out.Administrative.Village = village
+	out.ResolvedLevel = deepestAdministrativeLevel(province, city, county, town, village)
 	out.Municipality = isMunicipality(ac.Province)
 	out.Source = "tianditu"
 	g.upstreamOK.Add(1)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	json.NewEncoder(w).Encode(out)
+}
+
+func makeAdministrativeDivision(level, name, code string, codeLength int) (administrativeDivision, error) {
+	name, code = strings.TrimSpace(name), strings.TrimSpace(code)
+	d := administrativeDivision{Level: level, Name: name, Code: code}
+	if name == "" && code == "" {
+		return d, nil
+	}
+	if name == "" || code == "" || (codeLength > 0 && len(code) != codeLength) || !adminCodeRe.MatchString(code) {
+		return d, errors.New("invalid administrative division")
+	}
+	d.Available = true
+	return d, nil
+}
+
+func loadAdminDivisions(path, expectedSHA256 string) (map[string]adminDivisionRecord, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if expectedSHA256 != "" {
+		sum := sha256.Sum256(body)
+		if hex.EncodeToString(sum[:]) != expectedSHA256 {
+			return nil, errors.New("administrative catalog checksum mismatch")
+		}
+	}
+	records := make(map[string]adminDivisionRecord, 43000)
+	scanner := bufio.NewScanner(strings.NewReader(string(body)))
+	line := 0
+	for scanner.Scan() {
+		line++
+		fields := strings.Split(scanner.Text(), "\t")
+		if len(fields) != 4 {
+			return nil, fmt.Errorf("administrative catalog line %d: expected 4 fields", line)
+		}
+		level, err := strconv.Atoi(fields[2])
+		if err != nil || level < 1 || level > 4 {
+			return nil, fmt.Errorf("administrative catalog line %d: invalid level", line)
+		}
+		code, name, parent := strings.TrimSpace(fields[0]), strings.TrimSpace(fields[1]), strings.TrimSpace(fields[3])
+		wantLength := 6
+		if level == 4 {
+			wantLength = 9
+		}
+		if name == "" || len(code) != wantLength || !adminCodeRe.MatchString(code) {
+			return nil, fmt.Errorf("administrative catalog line %d: invalid code or name", line)
+		}
+		if _, exists := records[code]; exists {
+			return nil, fmt.Errorf("administrative catalog line %d: duplicate code", line)
+		}
+		records[code] = adminDivisionRecord{Code: code, Name: name, Level: level, Parent: parent}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	for _, record := range records {
+		if record.Level == 1 {
+			if record.Parent != "" {
+				return nil, fmt.Errorf("administrative catalog %s: province has parent", record.Code)
+			}
+			continue
+		}
+		// Some directly administered county-level divisions use their own
+		// six-digit code as pid (for example 469027 -> 469027).
+		if record.Level == 3 && record.Parent == record.Code {
+			continue
+		}
+		parent, ok := records[record.Parent]
+		if !ok || parent.Level != record.Level-1 {
+			return nil, fmt.Errorf("administrative catalog %s: invalid parent", record.Code)
+		}
+	}
+	return records, nil
+}
+
+func (g *gateway) catalogAdministrativeDivision(level, upstreamName, upstreamCode string, catalogLevel int) (administrativeDivision, error) {
+	upstreamName, upstreamCode = strings.TrimSpace(upstreamName), strings.TrimSpace(upstreamCode)
+	if upstreamName == "" && upstreamCode == "" {
+		return administrativeDivision{Level: level}, nil
+	}
+	wantLength := 9
+	if catalogLevel == 4 {
+		wantLength = 12
+	}
+	if _, err := makeAdministrativeDivision(level, upstreamName, upstreamCode, wantLength); err != nil || !strings.HasPrefix(upstreamCode, "156") {
+		return administrativeDivision{}, errors.New("invalid upstream administrative division")
+	}
+	record, ok := g.adminDivisions[strings.TrimPrefix(upstreamCode, "156")]
+	if !ok || record.Level != catalogLevel {
+		return administrativeDivision{}, errors.New("administrative code absent from catalog")
+	}
+	return administrativeDivision{Level: level, Available: true, Name: record.Name, Code: "156" + record.Code}, nil
+}
+
+func (g *gateway) validCatalogHierarchy(province, city, county, town administrativeDivision) bool {
+	localCode := func(d administrativeDivision) string { return strings.TrimPrefix(d.Code, "156") }
+	provinceRecord := g.adminDivisions[localCode(province)]
+	countyRecord := g.adminDivisions[localCode(county)]
+	if city.Available {
+		cityRecord := g.adminDivisions[localCode(city)]
+		if cityRecord.Parent != provinceRecord.Code || countyRecord.Parent != cityRecord.Code {
+			return false
+		}
+	} else {
+		countyParent, ok := g.adminDivisions[countyRecord.Parent]
+		if countyRecord.Parent == countyRecord.Code && strings.HasPrefix(countyRecord.Code, provinceRecord.Code[:2]) {
+			// Directly administered county-level division.
+		} else if !ok || countyParent.Parent != provinceRecord.Code {
+			return false
+		}
+	}
+	if town.Available {
+		townRecord := g.adminDivisions[localCode(town)]
+		if townRecord.Parent != countyRecord.Code {
+			return false
+		}
+	}
+	return true
+}
+
+func deepestAdministrativeLevel(levels ...administrativeDivision) string {
+	deepest := ""
+	for _, level := range levels {
+		if level.Available {
+			deepest = level.Level
+		}
+	}
+	return deepest
 }
 
 func isMunicipality(province string) bool {
