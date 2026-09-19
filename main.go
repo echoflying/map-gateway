@@ -940,7 +940,7 @@ func (g *gateway) handleCandidateResolution(w http.ResponseWriter, r *http.Reque
 	if !ok || !g.queryAllowed(w, r, true) {
 		return
 	}
-	key := "tianditu|" + coordinateCacheKey(lon, lat) + "|" + strconv.FormatFloat(radius, 'f', -1, 64) + "|" + keyword + "|" + dataTypes + "|" + strconv.Itoa(limit)
+	key := "tianditu|center-v2|" + coordinateCacheKey(lon, lat) + "|" + strconv.FormatFloat(radius, 'f', -1, 64) + "|" + keyword + "|" + dataTypes + "|" + strconv.Itoa(limit)
 	g.serveQueryJSON(w, r, "resolve/candidates", key, 10*time.Minute, func() (interface{}, int, error) {
 		reverse, status, err := g.reverseGeocode(lon, lat)
 		if err != nil {
@@ -969,12 +969,22 @@ func (g *gateway) handleCandidateResolution(w http.ResponseWriter, r *http.Reque
 }
 
 func preferredAdministrativeSearch(reverse reverseGeocodeResponse) (string, string) {
-	for _, division := range []administrativeDivision{reverse.Administrative.Town, reverse.Administrative.County, reverse.Administrative.City, reverse.Administrative.Province} {
+	// TDT queryType=12 accepts a 9-digit national administrative code. The
+	// bundled town code is 12 digits, so use the deepest TDT-compatible level.
+	for _, division := range []administrativeDivision{reverse.Administrative.County, reverse.Administrative.City, reverse.Administrative.Province} {
 		if division.Available {
-			return division.Name, "156" + division.Code
+			return division.Name, nationalAdministrativeCode(division.Code)
 		}
 	}
 	return "", ""
+}
+
+func nationalAdministrativeCode(code string) string {
+	code = strings.TrimSpace(code)
+	if strings.HasPrefix(code, "156") {
+		return code
+	}
+	return "156" + code
 }
 
 func queryKeysExactly(q url.Values, allowed map[string]bool) bool {

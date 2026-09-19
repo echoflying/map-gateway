@@ -197,6 +197,16 @@ func TestMunicipalityIsNotInferredFromMissingCity(t *testing.T) {
 	}
 }
 
+func TestPreferredAdministrativeSearchSkipsTwelveDigitTownCode(t *testing.T) {
+	var reverse reverseGeocodeResponse
+	reverse.Administrative.Town = administrativeDivision{Available: true, Name: "苏祠街道", Code: "156511402003"}
+	reverse.Administrative.County = administrativeDivision{Available: true, Name: "东坡区", Code: "156511402"}
+	name, specify := preferredAdministrativeSearch(reverse)
+	if name != "东坡区" || specify != "156511402" {
+		t.Fatalf("got %q %q", name, specify)
+	}
+}
+
 func TestReverseGeocodeValidationAndFailures(t *testing.T) {
 	g, _ := newTestGateway(t, nil)
 	for _, path := range []string{
