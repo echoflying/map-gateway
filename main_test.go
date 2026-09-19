@@ -307,6 +307,26 @@ func TestAdministrativeSearchKeepsProviderAreaCenterAndCaches(t *testing.T) {
 	}
 }
 
+func TestAdministrativeSearchUsesStrictNamedPOIWhenTDTDoesNotReturnArea(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"status":{"infocode":1000},"resultType":1,"prompt":[{"type":4,"admins":[{"adminName":"东坡区","adminCode":156511402}]}],"pois":[{"name":"东坡区","lonlat":"103.829699,30.045165","source":"0","hotPointID":"73B"}]}`)
+	}))
+	defer up.Close()
+	g, _ := newTestGateway(t, func(c *config) { c.SearchUpstream = up.URL })
+	rec := doGET(t, g, "/search/administrative?keyword=%E4%B8%9C%E5%9D%A1%E5%8C%BA&specify=156511402&origin_lon=103.8343&origin_lat=30.0508", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got administrativeSearchResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || len(got.Candidates) != 1 {
+		t.Fatalf("bad response: %v %s", err, rec.Body.String())
+	}
+	candidate := got.Candidates[0]
+	if candidate.Center == nil || candidate.Center.CenterType != "tianditu_named_poi" || candidate.Center.DistanceM == nil || *candidate.Center.DistanceM <= 0 || candidate.AdminCode != "156511402" || candidate.Level != "county" || candidate.Source != "tianditu.search.v2.poi" {
+		t.Fatalf("unexpected POI center candidate: %+v", candidate)
+	}
+}
+
 func TestNearbySearchReturnsNumericDistanceAndCaches100Meters(t *testing.T) {
 	var hits int32
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

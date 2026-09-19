@@ -13,17 +13,22 @@ map-gateway 的通用地理候选能力；它不包含 Trip Craft 或任何调�
 - 行政区中心来自天地图 `queryType=12` 的 `area.lonlat`。它是供应商提供的
   区域定位中心，标识为 `center_type: "tianditu_area_center"`，**不是**政府驻地，
   不应据此推断行政机关位置。
-- 天地图是否返回 `area` 取决于其索引；请求成功但 `candidates` 为空是正常的
-  可表达结果，不会把同次搜索中的同名 POI 冒充成行政区中心。
+- 天地图是否返回 `area` 取决于其索引。实测县、地级市和直辖市等常返回
+  `resultType=1` 的同名 POI，而不是 `area`。Gateway 会在名称与上游提示的
+  行政区完全一致时返回该坐标，标记为 `center_type: "tianditu_named_poi"` 与
+  `source: "tianditu.search.v2.poi"`；它不是 `area` 中心、更不是政府驻地。
+  没有 `area` 也没有可靠同名 POI 时才返回空 `candidates`。
 
 ## 行政区候选中心
 
 ```text
-GET /search/administrative?keyword={名称}&specify={天地图行政区代码}[&limit=1..50]
+GET /search/administrative?keyword={名称}&specify={天地图行政区代码}[&origin_lon=&origin_lat=][&limit=1..50]
 ```
 
 `keyword` 和 `specify` 必填；`specify` 透传为天地图限定区域，例如
 `156511402`。该接口使用天地图搜索 `queryType=12`。`limit` 默认 20，最大 50。
+可选 `origin_lon` 与 `origin_lat` 必须成对提供；提供时 `center.distance_m` 为
+输入原点至中心的 WGS84 大圆距离（米）。
 
 ```json
 {
@@ -32,11 +37,14 @@ GET /search/administrative?keyword={名称}&specify={天地图行政区代码}[&
   "candidates": [
     {
       "name": "东坡区",
+      "admin_code": "156511402",
+      "level": "county",
       "provider": "tianditu",
-      "source": "tianditu.search.v2.area",
+      "source": "tianditu.search.v2.poi",
       "center": {
         "location": {"lon": 103.83, "lat": 30.05},
-        "center_type": "tianditu_area_center"
+        "center_type": "tianditu_named_poi",
+        "distance_m": 604
       },
       "raw": {
         "lonlat": "103.83,30.05",
@@ -52,7 +60,9 @@ GET /search/administrative?keyword={名称}&specify={天地图行政区代码}[&
 
 `raw` 原样保留天地图的 `lonlat`、`bound`、`adminCode` 和 `level`；其中代码和
 层级即使供应商以 JSON 数字给出，也会安全转成字符串以避免精度和格式歧义。
-若 `lonlat` 不可解析，候选仍可返回原始值，但没有 `center`。
+若 `lonlat` 不可解析，候选仍可返回原始值，但没有 `center`。`level` 是 Gateway
+根据随发布的行政区目录规范化的行政层级；`raw.level` 仅在天地图确实返回 `area`
+时保留其地图显示级别。
 
 ## 附近 POI 候选
 
@@ -103,7 +113,9 @@ GET /resolve/candidates?lon={经度}&lat={纬度}&radius_m={1..10000}&keyword={�
 它一次返回兼容的 `reverse_geocode`、按反查到的最深行政区请求的
 `administrative_candidates`，以及 `poi_candidates`。调用方自行决定使用县、乡镇、
 行政区中心或某个 POI；Gateway 不提供业务判断。若供应商未返回行政区 `area`，
-`administrative_candidates` 是空数组；这不影响反查结果或 POI 候选。
+会尝试严格匹配的 `tianditu_named_poi`；两者都不可用时
+`administrative_candidates` 才是空数组。聚合接口总会在行政区候选的
+`center.distance_m` 中提供输入坐标到中心的距离。
 
 ## 缓存与失败语义
 
@@ -113,7 +125,7 @@ GET /resolve/candidates?lon={经度}&lat={纬度}&radius_m={1..10000}&keyword={�
 | 类别 | 缓存键 | 新鲜期 |
 |---|---|---|
 | 逆地理编码 | provider + 经纬度五位小数网格 | 30 天 |
-| 行政区中心 | provider + `specify`（adminCode）+ `keyword` + `limit` | 7 天 |
+| 行政区中心 | provider + `specify`（adminCode）+ level=all + `keyword` + 原点网格 + `limit` | 7 天 |
 | 附近 POI | provider + 经纬度五位小数网格 + 半径 + keyword/category（`data_types`）+ limit | 10 分钟 |
 | 聚合候选 | provider + 经纬度五位小数网格 + 半径 + keyword/category（`data_types`）+ limit | 10 分钟 |
 

@@ -62,7 +62,7 @@ sudo systemctl enable --now map-gateway
 | `/health` `/healthz` | 存活探针（返回 `ok`） |
 | `/cfg/maps` | 获取天地图客户端 KEY 与三个直连上游模板（Fallback 用） |
 | `/geocode/reverse?lon={经度}&lat={纬度}` | 坐标反查完整行政区划；不接受层级参数 |
-| `/search/administrative?keyword={名称}&specify={行政区代码}` | 返回 queryType=12 的行政区候选；中心仅标为 `tianditu_area_center` |
+| `/search/administrative?keyword={名称}&specify={行政区代码}` | 返回 queryType=12 的行政区候选；明确区分 `tianditu_area_center` 与同名 POI 中心 |
 | `/search/nearby?lon={经度}&lat={纬度}&radius_m={米}&keyword={关键词}` | 返回 queryType=3 的附近 POI 候选；半径 1–10,000 米 |
 | `/resolve/candidates?lon=&lat=&radius_m=&keyword=` | 通用聚合接口：逆地理、行政区候选、附近 POI 候选 |
 | `/tianditu/{vec\|cva\|img\|cia}/{z}/{x}/{y}.png` | 天地图底图瓦片 |

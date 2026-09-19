@@ -776,12 +776,15 @@ type queryLocation struct {
 }
 
 type administrativeCenterCandidate struct {
-	Name     string `json:"name"`
-	Provider string `json:"provider"`
-	Source   string `json:"source,omitempty"`
-	Center   *struct {
+	Name      string `json:"name"`
+	AdminCode string `json:"admin_code,omitempty"`
+	Level     string `json:"level,omitempty"`
+	Provider  string `json:"provider"`
+	Source    string `json:"source,omitempty"`
+	Center    *struct {
 		Location   queryLocation `json:"location"`
 		CenterType string        `json:"center_type"`
+		DistanceM  *float64      `json:"distance_m,omitempty"`
 	} `json:"center,omitempty"`
 	Raw struct {
 		Lonlat    string `json:"lonlat"`
@@ -836,13 +839,14 @@ type tiandituSearchResult struct {
 		InfoCode json.RawMessage `json:"infocode"`
 		Info     string          `json:"info"`
 	} `json:"status"`
-	Pois []map[string]json.RawMessage `json:"pois"`
-	Area json.RawMessage              `json:"area"`
+	Pois   []map[string]json.RawMessage `json:"pois"`
+	Area   json.RawMessage              `json:"area"`
+	Prompt []map[string]json.RawMessage `json:"prompt"`
 }
 
 func (g *gateway) handleAdministrativeSearch(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	if !queryKeysExactly(q, map[string]bool{"keyword": true, "specify": true, "limit": true}) || strings.TrimSpace(q.Get("keyword")) == "" || strings.TrimSpace(q.Get("specify")) == "" {
+	if !queryKeysExactly(q, map[string]bool{"keyword": true, "specify": true, "origin_lon": true, "origin_lat": true, "limit": true}) || strings.TrimSpace(q.Get("keyword")) == "" || strings.TrimSpace(q.Get("specify")) == "" {
 		http.Error(w, "keyword and specify are required", http.StatusBadRequest)
 		return
 	}
@@ -855,9 +859,17 @@ func (g *gateway) handleAdministrativeSearch(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "keyword or specify too long", http.StatusBadRequest)
 		return
 	}
-	key := "tianditu|" + specify + "|" + keyword + "|" + strconv.Itoa(limit)
+	origin, originOK := optionalOrigin(w, q)
+	if !originOK {
+		return
+	}
+	originKey := ""
+	if origin != nil {
+		originKey = coordinateCacheKey(origin.Lon, origin.Lat)
+	}
+	key := "tianditu|adminCode:" + specify + "|level:all|" + keyword + "|" + originKey + "|" + strconv.Itoa(limit)
 	g.serveQueryJSON(w, r, "search/administrative", key, 7*24*time.Hour, func() (interface{}, int, error) {
-		return g.administrativeSearch(keyword, specify, limit)
+		return g.administrativeSearch(keyword, specify, origin, limit)
 	})
 }
 
@@ -947,7 +959,8 @@ func (g *gateway) handleCandidateResolution(w http.ResponseWriter, r *http.Reque
 			POICandidates:            nearby.(nearbySearchResponse).Candidates,
 		}
 		if name, specify := preferredAdministrativeSearch(reverseResult); name != "" {
-			if centers, _, centerErr := g.administrativeSearch(name, specify, limit); centerErr == nil {
+			origin := queryLocation{Lon: lon, Lat: lat}
+			if centers, _, centerErr := g.administrativeSearch(name, specify, &origin, limit); centerErr == nil {
 				out.AdministrativeCandidates = centers.(administrativeSearchResponse).Candidates
 			}
 		}
@@ -985,7 +998,26 @@ func queryLimit(w http.ResponseWriter, q url.Values, fallback int) (int, bool) {
 	return limit, true
 }
 
-func (g *gateway) administrativeSearch(keyword, specify string, limit int) (interface{}, int, error) {
+func optionalOrigin(w http.ResponseWriter, q url.Values) (*queryLocation, bool) {
+	_, hasLon := q["origin_lon"]
+	_, hasLat := q["origin_lat"]
+	if !hasLon && !hasLat {
+		return nil, true
+	}
+	if !hasLon || !hasLat || q.Get("origin_lon") == "" || q.Get("origin_lat") == "" {
+		http.Error(w, "origin_lon and origin_lat must be provided together", http.StatusBadRequest)
+		return nil, false
+	}
+	lon, errLon := strconv.ParseFloat(q.Get("origin_lon"), 64)
+	lat, errLat := strconv.ParseFloat(q.Get("origin_lat"), 64)
+	if errLon != nil || errLat != nil || math.IsNaN(lon) || math.IsNaN(lat) || math.IsInf(lon, 0) || math.IsInf(lat, 0) || lon < -180 || lon > 180 || lat < -90 || lat > 90 {
+		http.Error(w, "invalid origin_lon or origin_lat", http.StatusBadRequest)
+		return nil, false
+	}
+	return &queryLocation{Lon: lon, Lat: lat}, true
+}
+
+func (g *gateway) administrativeSearch(keyword, specify string, origin *queryLocation, limit int) (interface{}, int, error) {
 	raw, status, err := g.tiandituSearch("search/administrative", map[string]interface{}{"keyWord": keyword, "queryType": 12, "start": 0, "count": limit, "specify": specify})
 	if err != nil {
 		return nil, status, err
@@ -993,9 +1025,19 @@ func (g *gateway) administrativeSearch(keyword, specify string, limit int) (inte
 	var out administrativeSearchResponse
 	out.SchemaVersion, out.Provider = "1.0", "tianditu"
 	for _, area := range objectsFromRaw(raw.Area) {
-		candidate, ok := administrativeCandidate(area)
+		candidate, ok := g.administrativeCandidate(area, origin)
 		if ok {
 			out.Candidates = append(out.Candidates, candidate)
+		}
+	}
+	if len(out.Candidates) == 0 {
+		adminName, adminCode := searchPromptAdmin(raw.Prompt, keyword, specify)
+		for _, poi := range raw.Pois {
+			candidate, ok := g.administrativePOICandidate(poi, adminName, adminCode, origin)
+			if ok {
+				out.Candidates = append(out.Candidates, candidate)
+				break
+			}
 		}
 	}
 	if out.Candidates == nil {
@@ -1098,7 +1140,7 @@ func parseLonlat(value string) (queryLocation, bool) {
 	return queryLocation{Lon: lon, Lat: lat}, true
 }
 
-func administrativeCandidate(raw map[string]json.RawMessage) (administrativeCenterCandidate, bool) {
+func (g *gateway) administrativeCandidate(raw map[string]json.RawMessage, origin *queryLocation) (administrativeCenterCandidate, bool) {
 	name := rawText(raw["name"])
 	if name == "" {
 		return administrativeCenterCandidate{}, false
@@ -1108,13 +1150,94 @@ func administrativeCandidate(raw map[string]json.RawMessage) (administrativeCent
 	candidate.Raw.Bound = rawText(raw["bound"])
 	candidate.Raw.AdminCode = rawText(raw["adminCode"])
 	candidate.Raw.Level = rawText(raw["level"])
+	candidate.AdminCode = candidate.Raw.AdminCode
+	candidate.Level = g.administrativeLevel(candidate.AdminCode)
 	if location, ok := parseLonlat(candidate.Raw.Lonlat); ok {
+		var distance *float64
+		if origin != nil {
+			d := distanceMeters(*origin, location)
+			distance = &d
+		}
 		candidate.Center = &struct {
 			Location   queryLocation `json:"location"`
 			CenterType string        `json:"center_type"`
-		}{Location: location, CenterType: "tianditu_area_center"}
+			DistanceM  *float64      `json:"distance_m,omitempty"`
+		}{Location: location, CenterType: "tianditu_area_center", DistanceM: distance}
 	}
 	return candidate, true
+}
+
+func searchPromptAdmin(prompts []map[string]json.RawMessage, keyword, specify string) (string, string) {
+	for _, prompt := range prompts {
+		var admins []map[string]json.RawMessage
+		if json.Unmarshal(prompt["admins"], &admins) != nil {
+			continue
+		}
+		for _, admin := range admins {
+			name, code := rawText(admin["adminName"]), rawText(admin["adminCode"])
+			if code == specify || name == keyword {
+				return name, code
+			}
+		}
+	}
+	return keyword, specify
+}
+
+// administrativePOICandidate is deliberately a separate center type from an
+// area result. TDT commonly returns a named POI for an administrative query
+// (resultType=1) rather than area.lonlat; it is useful, but is not an area
+// centroid or a government-seat assertion.
+func (g *gateway) administrativePOICandidate(raw map[string]json.RawMessage, adminName, adminCode string, origin *queryLocation) (administrativeCenterCandidate, bool) {
+	poiName := rawText(raw["name"])
+	location, ok := parseLonlat(rawText(raw["lonlat"]))
+	if !ok || poiName == "" || (poiName != adminName && poiName != strings.TrimPrefix(adminName, "中国")) {
+		return administrativeCenterCandidate{}, false
+	}
+	var distance *float64
+	if origin != nil {
+		d := distanceMeters(*origin, location)
+		distance = &d
+	}
+	candidate := administrativeCenterCandidate{
+		Name:      adminName,
+		AdminCode: adminCode,
+		Level:     g.administrativeLevel(adminCode),
+		Provider:  "tianditu",
+		Source:    "tianditu.search.v2.poi",
+	}
+	candidate.Raw.Lonlat = rawText(raw["lonlat"])
+	candidate.Raw.AdminCode = adminCode
+	candidate.Center = &struct {
+		Location   queryLocation `json:"location"`
+		CenterType string        `json:"center_type"`
+		DistanceM  *float64      `json:"distance_m,omitempty"`
+	}{Location: location, CenterType: "tianditu_named_poi", DistanceM: distance}
+	return candidate, true
+}
+
+func (g *gateway) administrativeLevel(code string) string {
+	code = strings.TrimPrefix(strings.TrimSpace(code), "156")
+	if record, ok := g.adminDivisions[code]; ok {
+		switch record.Level {
+		case 1:
+			return "province"
+		case 2:
+			return "city"
+		case 3:
+			return "county"
+		case 4:
+			return "town"
+		}
+	}
+	return ""
+}
+
+func distanceMeters(a, b queryLocation) float64 {
+	const earthRadiusM = 6371008.8
+	toRadians := math.Pi / 180
+	dLat, dLon := (b.Lat-a.Lat)*toRadians, (b.Lon-a.Lon)*toRadians
+	h := math.Sin(dLat/2)*math.Sin(dLat/2) + math.Cos(a.Lat*toRadians)*math.Cos(b.Lat*toRadians)*math.Sin(dLon/2)*math.Sin(dLon/2)
+	return 2 * earthRadiusM * math.Atan2(math.Sqrt(h), math.Sqrt(1-h))
 }
 
 func nearbyCandidate(raw map[string]json.RawMessage) (nearbyPOICandidate, bool) {
