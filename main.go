@@ -91,6 +91,7 @@ const (
 	// Tianditu WMTS; tk=<TIANDITU_KEY> is appended server-side only.
 	tiandituUpstream = "https://t%d.tianditu.gov.cn/%s_w/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=%s&STYLE=default&TILEMATRIXSET=w&FORMAT=tiles&TILEMATRIX=%s&TILEROW=%s&TILECOL=%s&tk=%s"
 	geocoderUpstream = "https://api.tianditu.gov.cn/geocoder"
+	searchUpstream   = "https://api.tianditu.gov.cn/v2/search"
 )
 
 // Strictly numeric, length-bounded path components: z up to 2 digits,
@@ -125,6 +126,7 @@ type config struct {
 	SatUpstream      string
 	TiandituUpstream string
 	GeocoderUpstream string
+	SearchUpstream   string
 }
 
 func defaultConfig() config {
@@ -145,6 +147,7 @@ func defaultConfig() config {
 		SatUpstream:          satUpstream,
 		TiandituUpstream:     tiandituUpstream,
 		GeocoderUpstream:     geocoderUpstream,
+		SearchUpstream:       searchUpstream,
 	}
 }
 
@@ -202,6 +205,7 @@ func configFromEnv() config {
 	cfg.SatUpstream = firstNonEmpty(get("MAP_SAT_UPSTREAM"), cfg.SatUpstream)
 	cfg.TiandituUpstream = firstNonEmpty(get("MAP_TIANDITU_UPSTREAM"), cfg.TiandituUpstream)
 	cfg.GeocoderUpstream = firstNonEmpty(get("MAP_GEOCODER_UPSTREAM"), cfg.GeocoderUpstream)
+	cfg.SearchUpstream = firstNonEmpty(get("MAP_SEARCH_UPSTREAM"), cfg.SearchUpstream)
 	return cfg
 }
 
@@ -426,6 +430,12 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.handleMapConfig(rec, r)
 	case path == "/geocode/reverse":
 		g.handleReverseGeocode(rec, r)
+	case path == "/search/administrative":
+		g.handleAdministrativeSearch(rec, r)
+	case path == "/search/nearby":
+		g.handleNearbySearch(rec, r)
+	case path == "/resolve/candidates":
+		g.handleCandidateResolution(rec, r)
 	case strings.HasPrefix(path, "/tile/"):
 		g.handleTile(rec, r)
 	case strings.HasPrefix(path, "/tianditu/"):
@@ -434,7 +444,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(rec, r)
 	}
 	// Admin routes are recorded inside their handlers; tiles are recorded here.
-	if strings.HasPrefix(path, "/tile/") || strings.HasPrefix(path, "/tianditu/") || path == "/geocode/reverse" {
+	if strings.HasPrefix(path, "/tile/") || strings.HasPrefix(path, "/tianditu/") || path == "/geocode/reverse" || path == "/search/administrative" || path == "/search/nearby" || path == "/resolve/candidates" {
 		g.recordRequest(path, rec.status, rec.written, time.Since(start), "", r.Header.Get("Referer"))
 	}
 done:
@@ -508,41 +518,58 @@ type tiandituGeocoderResponse struct {
 // so village is retained in our contract and returned empty until such a source
 // is available.
 func (g *gateway) handleReverseGeocode(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", "GET")
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	lon, lat, ok := requestCoordinates(w, r, map[string]bool{"lon": true, "lat": true})
+	if !ok || !g.queryAllowed(w, r, true) {
 		return
 	}
+	g.serveQueryJSON(w, r, "geocode/reverse", coordinateCacheKey(lon, lat), 30*24*time.Hour, func() (interface{}, int, error) {
+		return g.reverseGeocode(lon, lat)
+	})
+}
+
+func (g *gateway) queryAllowed(w http.ResponseWriter, r *http.Request, requiresCatalog bool) bool {
 	if !g.tileRateAllow(r) {
 		g.rateLimited.Add(1)
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
-		return
+		return false
 	}
 	if g.cfg.TiandituKey == "" {
 		http.Error(w, "tianditu key not configured", http.StatusServiceUnavailable)
-		return
+		return false
 	}
-	if g.adminDivisionsErr != nil {
+	if requiresCatalog && g.adminDivisionsErr != nil {
 		http.Error(w, "administrative catalog unavailable", http.StatusServiceUnavailable)
-		return
+		return false
 	}
+	return true
+}
+
+func requestCoordinates(w http.ResponseWriter, r *http.Request, allowed map[string]bool) (float64, float64, bool) {
 	q := r.URL.Query()
-	if len(q) != 2 || len(q["lon"]) != 1 || len(q["lat"]) != 1 {
-		http.Error(w, "exactly lon and lat are required", http.StatusBadRequest)
-		return
+	for key, values := range q {
+		if !allowed[key] || len(values) != 1 {
+			http.Error(w, "invalid query parameters", http.StatusBadRequest)
+			return 0, 0, false
+		}
+	}
+	if len(q["lon"]) != 1 || len(q["lat"]) != 1 {
+		http.Error(w, "lon and lat are required", http.StatusBadRequest)
+		return 0, 0, false
 	}
 	lon, errLon := strconv.ParseFloat(q.Get("lon"), 64)
 	lat, errLat := strconv.ParseFloat(q.Get("lat"), 64)
 	if errLon != nil || errLat != nil || math.IsNaN(lon) || math.IsNaN(lat) || math.IsInf(lon, 0) || math.IsInf(lat, 0) || lon < -180 || lon > 180 || lat < -90 || lat > 90 {
 		http.Error(w, "invalid lon or lat", http.StatusBadRequest)
-		return
+		return 0, 0, false
 	}
+	return lon, lat, true
+}
 
+func (g *gateway) reverseGeocode(lon, lat float64) (interface{}, int, error) {
 	postStr, _ := json.Marshal(map[string]interface{}{"lon": lon, "lat": lat, "ver": 1})
 	upstream, err := url.Parse(g.cfg.GeocoderUpstream)
 	if err != nil {
-		http.Error(w, "geocoder unavailable", http.StatusBadGateway)
-		return
+		return nil, http.StatusBadGateway, errors.New("geocoder unavailable")
 	}
 	params := upstream.Query()
 	params.Set("postStr", string(postStr))
@@ -555,59 +582,50 @@ func (g *gateway) handleReverseGeocode(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		g.upstreamErr.Add(1)
 		log.Printf("geocoder upstream: %s", g.redact(err.Error()))
-		http.Error(w, "geocoder unavailable", http.StatusBadGateway)
-		return
+		return nil, http.StatusBadGateway, errors.New("geocoder unavailable")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		g.upstreamErr.Add(1)
 		log.Printf("geocoder upstream status %d", resp.StatusCode)
-		http.Error(w, "geocoder unavailable", http.StatusBadGateway)
-		return
+		return nil, http.StatusBadGateway, errors.New("geocoder unavailable")
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil || len(body) > 1<<20 {
 		g.upstreamErr.Add(1)
-		http.Error(w, "invalid geocoder response", http.StatusBadGateway)
-		return
+		return nil, http.StatusBadGateway, errors.New("invalid geocoder response")
 	}
 	var raw tiandituGeocoderResponse
 	if json.Unmarshal(body, &raw) != nil || raw.Status != "0" {
 		g.upstreamErr.Add(1)
-		http.Error(w, "geocoder returned no result", http.StatusNotFound)
-		return
+		return nil, http.StatusNotFound, errors.New("geocoder returned no result")
 	}
 
 	ac := raw.Result.AddressComponent
 	country, err := makeAdministrativeDivision("country", ac.Nation, "156", 3)
 	if err != nil {
 		g.upstreamErr.Add(1)
-		http.Error(w, "incomplete geocoder response", http.StatusBadGateway)
-		return
+		return nil, http.StatusBadGateway, errors.New("incomplete geocoder response")
 	}
 	province, err := g.catalogAdministrativeDivision("province", ac.Province, ac.ProvinceCode, 1)
 	if err != nil {
 		g.upstreamErr.Add(1)
-		http.Error(w, "incomplete geocoder response", http.StatusBadGateway)
-		return
+		return nil, http.StatusBadGateway, errors.New("incomplete geocoder response")
 	}
 	city, err := g.catalogAdministrativeDivision("city", ac.City, ac.CityCode, 2)
 	if err != nil {
 		g.upstreamErr.Add(1)
-		http.Error(w, "incomplete geocoder response", http.StatusBadGateway)
-		return
+		return nil, http.StatusBadGateway, errors.New("incomplete geocoder response")
 	}
 	county, err := g.catalogAdministrativeDivision("county", ac.County, ac.CountyCode, 3)
 	if err != nil {
 		g.upstreamErr.Add(1)
-		http.Error(w, "incomplete geocoder response", http.StatusBadGateway)
-		return
+		return nil, http.StatusBadGateway, errors.New("incomplete geocoder response")
 	}
 	town, err := g.catalogAdministrativeDivision("town", ac.Town, ac.TownCode, 4)
 	if err != nil || !province.Available || !county.Available || !g.validCatalogHierarchy(province, city, county, town) {
 		g.upstreamErr.Add(1)
-		http.Error(w, "incomplete geocoder response", http.StatusBadGateway)
-		return
+		return nil, http.StatusBadGateway, errors.New("incomplete geocoder response")
 	}
 	village, _ := makeAdministrativeDivision("village", "", "", 0)
 
@@ -627,9 +645,518 @@ func (g *gateway) handleReverseGeocode(w http.ResponseWriter, r *http.Request) {
 	out.Municipality = isMunicipality(ac.Province)
 	out.Source = "tianditu"
 	g.upstreamOK.Add(1)
+	return out, http.StatusOK, nil
+}
+
+// queryCacheEntry stores completed, provider-normalized query responses on
+// disk. It intentionally never stores request URLs, which could contain a key.
+type queryCacheEntry struct {
+	FetchedAt time.Time       `json:"fetched_at"`
+	ExpiresAt time.Time       `json:"expires_at"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+type queryCacheMetadata struct {
+	State     string `json:"state"`
+	FetchedAt string `json:"fetched_at"`
+	ExpiresAt string `json:"expires_at"`
+	Version   string `json:"version"`
+}
+
+func coordinateCacheKey(lon, lat float64) string {
+	// Five decimal places is an approximately one-metre grid. It stops GPS
+	// jitter from creating unbounded entries while retaining useful precision.
+	return fmt.Sprintf("%.5f,%.5f", lon, lat)
+}
+
+func (g *gateway) queryCacheFile(endpoint, key string) string {
+	sum := sha256.Sum256([]byte(endpoint + "\x00" + key))
+	return filepath.Join(g.cfg.CacheDir, "queries", endpoint, hex.EncodeToString(sum[:])+".json")
+}
+
+func (g *gateway) readQueryCache(file string) (queryCacheEntry, bool) {
+	body, err := os.ReadFile(file)
+	if err != nil {
+		return queryCacheEntry{}, false
+	}
+	var entry queryCacheEntry
+	if json.Unmarshal(body, &entry) != nil || len(entry.Payload) == 0 || entry.FetchedAt.IsZero() || entry.ExpiresAt.IsZero() {
+		return queryCacheEntry{}, false
+	}
+	return entry, true
+}
+
+func queryPayloadWithMetadata(payload []byte, state string, entry queryCacheEntry) ([]byte, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &obj); err != nil {
+		return nil, err
+	}
+	meta, err := json.Marshal(queryCacheMetadata{
+		State:     state,
+		FetchedAt: entry.FetchedAt.UTC().Format(time.RFC3339),
+		ExpiresAt: entry.ExpiresAt.UTC().Format(time.RFC3339),
+		Version:   "1",
+	})
+	if err != nil {
+		return nil, err
+	}
+	obj["cache"] = meta
+	return json.Marshal(obj)
+}
+
+// serveQueryJSON is the shared cache policy for all Tianditu query endpoints.
+// A fresh entry is served without an upstream call. An expired entry can be
+// returned only after a refresh fails, and is explicitly marked stale.
+func (g *gateway) serveQueryJSON(w http.ResponseWriter, r *http.Request, endpoint, key string, ttl time.Duration, build func() (interface{}, int, error)) {
+	file := g.queryCacheFile(endpoint, key)
+	entry, hasEntry := g.readQueryCache(file)
+	now := time.Now()
+	if hasEntry && now.Before(entry.ExpiresAt) {
+		g.cacheHit.Add(1)
+		g.endpointHit(endpoint)
+		g.writeQueryResponse(w, entry, "hit")
+		return
+	}
+	g.cacheMiss.Add(1)
+	mu := g.lockFor("query:" + file)
+	mu.Lock()
+	defer mu.Unlock()
+	// A concurrent request may have refreshed it while this request waited.
+	entry, hasEntry = g.readQueryCache(file)
+	now = time.Now()
+	if hasEntry && now.Before(entry.ExpiresAt) {
+		g.cacheHit.Add(1)
+		g.endpointHit(endpoint)
+		g.writeQueryResponse(w, entry, "hit")
+		return
+	}
+
+	result, status, err := build()
+	if err != nil {
+		if hasEntry {
+			g.cacheHit.Add(1)
+			g.endpointHit(endpoint)
+			g.writeQueryResponse(w, entry, "stale")
+			return
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	payload, err := json.Marshal(result)
+	if err != nil {
+		http.Error(w, "response encoding failed", http.StatusInternalServerError)
+		return
+	}
+	entry = queryCacheEntry{FetchedAt: now.UTC(), ExpiresAt: now.UTC().Add(ttl), Payload: payload}
+	encoded, err := json.Marshal(entry)
+	if err != nil {
+		http.Error(w, "response encoding failed", http.StatusInternalServerError)
+		return
+	}
+	g.cacheWrite(file, encoded)
+	g.writeQueryResponse(w, entry, "miss")
+}
+
+func (g *gateway) writeQueryResponse(w http.ResponseWriter, entry queryCacheEntry, state string) {
+	body, err := queryPayloadWithMetadata(entry.Payload, state, entry)
+	if err != nil {
+		http.Error(w, "cached response invalid", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=86400")
-	json.NewEncoder(w).Encode(out)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Map-Gateway-Cache", state)
+	w.WriteHeader(http.StatusOK)
+	w.Write(body)
+}
+
+type queryLocation struct {
+	Lon float64 `json:"lon"`
+	Lat float64 `json:"lat"`
+}
+
+type administrativeCenterCandidate struct {
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+	Source   string `json:"source,omitempty"`
+	Center   *struct {
+		Location   queryLocation `json:"location"`
+		CenterType string        `json:"center_type"`
+	} `json:"center,omitempty"`
+	Raw struct {
+		Lonlat    string `json:"lonlat"`
+		Bound     string `json:"bound"`
+		AdminCode string `json:"adminCode"`
+		Level     string `json:"level"`
+	} `json:"raw"`
+}
+
+type administrativeSearchResponse struct {
+	SchemaVersion string                          `json:"schema_version"`
+	Provider      string                          `json:"provider"`
+	Candidates    []administrativeCenterCandidate `json:"candidates"`
+}
+
+type nearbyPOICandidate struct {
+	Name       string        `json:"name"`
+	Location   queryLocation `json:"location"`
+	DistanceM  float64       `json:"distance_m"`
+	TypeCode   string        `json:"type_code,omitempty"`
+	TypeName   string        `json:"type_name,omitempty"`
+	Provider   string        `json:"provider"`
+	Source     string        `json:"source,omitempty"`
+	HotPointID string        `json:"hotPointID,omitempty"`
+	SourceID   string        `json:"source_id,omitempty"`
+	Province   struct {
+		Name string `json:"name,omitempty"`
+		Code string `json:"code,omitempty"`
+	} `json:"province"`
+	City struct {
+		Name string `json:"name,omitempty"`
+		Code string `json:"code,omitempty"`
+	} `json:"city"`
+	County struct {
+		Name string `json:"name,omitempty"`
+		Code string `json:"code,omitempty"`
+	} `json:"county"`
+}
+
+type nearbySearchResponse struct {
+	SchemaVersion string               `json:"schema_version"`
+	Provider      string               `json:"provider"`
+	Location      queryLocation        `json:"location"`
+	QueryRadiusM  float64              `json:"query_radius_m"`
+	Keyword       string               `json:"keyword"`
+	DataTypes     string               `json:"data_types,omitempty"`
+	Candidates    []nearbyPOICandidate `json:"candidates"`
+}
+
+type tiandituSearchResult struct {
+	Status struct {
+		InfoCode json.RawMessage `json:"infocode"`
+		Info     string          `json:"info"`
+	} `json:"status"`
+	Pois []map[string]json.RawMessage `json:"pois"`
+	Area json.RawMessage              `json:"area"`
+}
+
+func (g *gateway) handleAdministrativeSearch(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if !queryKeysExactly(q, map[string]bool{"keyword": true, "specify": true, "limit": true}) || strings.TrimSpace(q.Get("keyword")) == "" || strings.TrimSpace(q.Get("specify")) == "" {
+		http.Error(w, "keyword and specify are required", http.StatusBadRequest)
+		return
+	}
+	limit, ok := queryLimit(w, q, 20)
+	if !ok || !g.queryAllowed(w, r, false) {
+		return
+	}
+	keyword, specify := strings.TrimSpace(q.Get("keyword")), strings.TrimSpace(q.Get("specify"))
+	if len([]rune(keyword)) > 100 || len([]rune(specify)) > 100 {
+		http.Error(w, "keyword or specify too long", http.StatusBadRequest)
+		return
+	}
+	key := "tianditu|" + specify + "|" + keyword + "|" + strconv.Itoa(limit)
+	g.serveQueryJSON(w, r, "search/administrative", key, 7*24*time.Hour, func() (interface{}, int, error) {
+		return g.administrativeSearch(keyword, specify, limit)
+	})
+}
+
+func (g *gateway) handleNearbySearch(w http.ResponseWriter, r *http.Request) {
+	lon, lat, ok := requestCoordinates(w, r, map[string]bool{"lon": true, "lat": true, "radius_m": true, "keyword": true, "data_types": true, "limit": true})
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	keyword := strings.TrimSpace(q.Get("keyword"))
+	if keyword == "" || len([]rune(keyword)) > 100 || len(q["radius_m"]) != 1 {
+		http.Error(w, "keyword and radius_m are required", http.StatusBadRequest)
+		return
+	}
+	radius, err := strconv.ParseFloat(q.Get("radius_m"), 64)
+	if err != nil || math.IsNaN(radius) || math.IsInf(radius, 0) || radius <= 0 || radius > 10000 {
+		http.Error(w, "radius_m must be within 0..10000", http.StatusBadRequest)
+		return
+	}
+	dataTypes := strings.TrimSpace(q.Get("data_types"))
+	if len([]rune(dataTypes)) > 200 {
+		http.Error(w, "data_types too long", http.StatusBadRequest)
+		return
+	}
+	limit, ok := queryLimit(w, q, 20)
+	if !ok || !g.queryAllowed(w, r, false) {
+		return
+	}
+	key := "tianditu|" + coordinateCacheKey(lon, lat) + "|" + strconv.FormatFloat(radius, 'f', -1, 64) + "|" + keyword + "|" + dataTypes + "|" + strconv.Itoa(limit)
+	g.serveQueryJSON(w, r, "search/nearby", key, 10*time.Minute, func() (interface{}, int, error) {
+		return g.nearbySearch(lon, lat, radius, keyword, dataTypes, limit)
+	})
+}
+
+type candidateResolutionResponse struct {
+	SchemaVersion            string                          `json:"schema_version"`
+	Provider                 string                          `json:"provider"`
+	ReverseGeocode           reverseGeocodeResponse          `json:"reverse_geocode"`
+	AdministrativeCandidates []administrativeCenterCandidate `json:"administrative_candidates"`
+	POICandidates            []nearbyPOICandidate            `json:"poi_candidates"`
+}
+
+// handleCandidateResolution combines the existing reverse result with the
+// generic center and POI candidates. It remains domain-neutral: callers
+// decide whether any candidate is suitable for a display or business action.
+func (g *gateway) handleCandidateResolution(w http.ResponseWriter, r *http.Request) {
+	lon, lat, ok := requestCoordinates(w, r, map[string]bool{"lon": true, "lat": true, "radius_m": true, "keyword": true, "data_types": true, "limit": true})
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	keyword := strings.TrimSpace(q.Get("keyword"))
+	if keyword == "" || len([]rune(keyword)) > 100 || len(q["radius_m"]) != 1 {
+		http.Error(w, "keyword and radius_m are required", http.StatusBadRequest)
+		return
+	}
+	radius, err := strconv.ParseFloat(q.Get("radius_m"), 64)
+	if err != nil || math.IsNaN(radius) || math.IsInf(radius, 0) || radius <= 0 || radius > 10000 {
+		http.Error(w, "radius_m must be within 0..10000", http.StatusBadRequest)
+		return
+	}
+	dataTypes := strings.TrimSpace(q.Get("data_types"))
+	if len([]rune(dataTypes)) > 200 {
+		http.Error(w, "data_types too long", http.StatusBadRequest)
+		return
+	}
+	limit, ok := queryLimit(w, q, 20)
+	if !ok || !g.queryAllowed(w, r, true) {
+		return
+	}
+	key := "tianditu|" + coordinateCacheKey(lon, lat) + "|" + strconv.FormatFloat(radius, 'f', -1, 64) + "|" + keyword + "|" + dataTypes + "|" + strconv.Itoa(limit)
+	g.serveQueryJSON(w, r, "resolve/candidates", key, 10*time.Minute, func() (interface{}, int, error) {
+		reverse, status, err := g.reverseGeocode(lon, lat)
+		if err != nil {
+			return nil, status, err
+		}
+		reverseResult := reverse.(reverseGeocodeResponse)
+		nearby, status, err := g.nearbySearch(lon, lat, radius, keyword, dataTypes, limit)
+		if err != nil {
+			return nil, status, err
+		}
+		out := candidateResolutionResponse{
+			SchemaVersion:            "1.0",
+			Provider:                 "map-gateway",
+			ReverseGeocode:           reverseResult,
+			AdministrativeCandidates: []administrativeCenterCandidate{},
+			POICandidates:            nearby.(nearbySearchResponse).Candidates,
+		}
+		if name, specify := preferredAdministrativeSearch(reverseResult); name != "" {
+			if centers, _, centerErr := g.administrativeSearch(name, specify, limit); centerErr == nil {
+				out.AdministrativeCandidates = centers.(administrativeSearchResponse).Candidates
+			}
+		}
+		return out, http.StatusOK, nil
+	})
+}
+
+func preferredAdministrativeSearch(reverse reverseGeocodeResponse) (string, string) {
+	for _, division := range []administrativeDivision{reverse.Administrative.Town, reverse.Administrative.County, reverse.Administrative.City, reverse.Administrative.Province} {
+		if division.Available {
+			return division.Name, "156" + division.Code
+		}
+	}
+	return "", ""
+}
+
+func queryKeysExactly(q url.Values, allowed map[string]bool) bool {
+	for key, values := range q {
+		if !allowed[key] || len(values) != 1 {
+			return false
+		}
+	}
+	return true
+}
+
+func queryLimit(w http.ResponseWriter, q url.Values, fallback int) (int, bool) {
+	if len(q["limit"]) == 0 || q.Get("limit") == "" {
+		return fallback, true
+	}
+	limit, err := strconv.Atoi(q.Get("limit"))
+	if err != nil || limit < 1 || limit > 50 {
+		http.Error(w, "limit must be within 1..50", http.StatusBadRequest)
+		return 0, false
+	}
+	return limit, true
+}
+
+func (g *gateway) administrativeSearch(keyword, specify string, limit int) (interface{}, int, error) {
+	raw, status, err := g.tiandituSearch("search/administrative", map[string]interface{}{"keyWord": keyword, "queryType": 12, "start": 0, "count": limit, "specify": specify})
+	if err != nil {
+		return nil, status, err
+	}
+	var out administrativeSearchResponse
+	out.SchemaVersion, out.Provider = "1.0", "tianditu"
+	for _, area := range objectsFromRaw(raw.Area) {
+		candidate, ok := administrativeCandidate(area)
+		if ok {
+			out.Candidates = append(out.Candidates, candidate)
+		}
+	}
+	if out.Candidates == nil {
+		out.Candidates = []administrativeCenterCandidate{}
+	}
+	return out, http.StatusOK, nil
+}
+
+func (g *gateway) nearbySearch(lon, lat, radius float64, keyword, dataTypes string, limit int) (interface{}, int, error) {
+	post := map[string]interface{}{"keyWord": keyword, "level": 18, "queryRadius": radius, "pointLonlat": fmt.Sprintf("%.8f,%.8f", lon, lat), "queryType": 3, "start": 0, "count": limit}
+	if dataTypes != "" {
+		post["dataTypes"] = dataTypes
+	}
+	raw, status, err := g.tiandituSearch("search/nearby", post)
+	if err != nil {
+		return nil, status, err
+	}
+	out := nearbySearchResponse{SchemaVersion: "1.0", Provider: "tianditu", Location: queryLocation{Lon: lon, Lat: lat}, QueryRadiusM: radius, Keyword: keyword, DataTypes: dataTypes, Candidates: []nearbyPOICandidate{}}
+	for _, poi := range raw.Pois {
+		candidate, ok := nearbyCandidate(poi)
+		if ok {
+			out.Candidates = append(out.Candidates, candidate)
+		}
+	}
+	return out, http.StatusOK, nil
+}
+
+func (g *gateway) tiandituSearch(endpoint string, post map[string]interface{}) (tiandituSearchResult, int, error) {
+	var zero tiandituSearchResult
+	postStr, _ := json.Marshal(post)
+	upstream, err := url.Parse(g.cfg.SearchUpstream)
+	if err != nil {
+		return zero, http.StatusBadGateway, errors.New("search unavailable")
+	}
+	params := upstream.Query()
+	params.Set("postStr", string(postStr))
+	params.Set("type", "query")
+	params.Set("tk", g.cfg.TiandituKey)
+	upstream.RawQuery = params.Encode()
+	g.endpointUpstream(endpoint)
+	resp, err := g.client.Get(upstream.String())
+	if err != nil {
+		g.upstreamErr.Add(1)
+		log.Printf("search upstream: %s", g.redact(err.Error()))
+		return zero, http.StatusBadGateway, errors.New("search unavailable")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		g.upstreamErr.Add(1)
+		log.Printf("search upstream status %d", resp.StatusCode)
+		return zero, http.StatusBadGateway, errors.New("search unavailable")
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	if err != nil || len(body) > 1<<20 || json.Unmarshal(body, &zero) != nil {
+		g.upstreamErr.Add(1)
+		return tiandituSearchResult{}, http.StatusBadGateway, errors.New("invalid search response")
+	}
+	if rawText(zero.Status.InfoCode) != "1000" {
+		g.upstreamErr.Add(1)
+		return tiandituSearchResult{}, http.StatusBadGateway, errors.New("search returned no result")
+	}
+	g.upstreamOK.Add(1)
+	return zero, http.StatusOK, nil
+}
+
+func rawText(raw json.RawMessage) string {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return strings.TrimSpace(text)
+	}
+	var number json.Number
+	if json.Unmarshal(raw, &number) == nil {
+		return number.String()
+	}
+	return ""
+}
+
+func objectsFromRaw(raw json.RawMessage) []map[string]json.RawMessage {
+	var objects []map[string]json.RawMessage
+	if json.Unmarshal(raw, &objects) == nil {
+		return objects
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) == nil && object != nil {
+		return []map[string]json.RawMessage{object}
+	}
+	return nil
+}
+
+func parseLonlat(value string) (queryLocation, bool) {
+	parts := strings.Split(strings.TrimSpace(value), ",")
+	if len(parts) != 2 {
+		return queryLocation{}, false
+	}
+	lon, errLon := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	lat, errLat := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if errLon != nil || errLat != nil || lon < -180 || lon > 180 || lat < -90 || lat > 90 {
+		return queryLocation{}, false
+	}
+	return queryLocation{Lon: lon, Lat: lat}, true
+}
+
+func administrativeCandidate(raw map[string]json.RawMessage) (administrativeCenterCandidate, bool) {
+	name := rawText(raw["name"])
+	if name == "" {
+		return administrativeCenterCandidate{}, false
+	}
+	candidate := administrativeCenterCandidate{Name: name, Provider: "tianditu", Source: "tianditu.search.v2.area"}
+	candidate.Raw.Lonlat = rawText(raw["lonlat"])
+	candidate.Raw.Bound = rawText(raw["bound"])
+	candidate.Raw.AdminCode = rawText(raw["adminCode"])
+	candidate.Raw.Level = rawText(raw["level"])
+	if location, ok := parseLonlat(candidate.Raw.Lonlat); ok {
+		candidate.Center = &struct {
+			Location   queryLocation `json:"location"`
+			CenterType string        `json:"center_type"`
+		}{Location: location, CenterType: "tianditu_area_center"}
+	}
+	return candidate, true
+}
+
+func nearbyCandidate(raw map[string]json.RawMessage) (nearbyPOICandidate, bool) {
+	name := rawText(raw["name"])
+	location, locationOK := parseLonlat(rawText(raw["lonlat"]))
+	distance, distanceOK := parseDistanceMeters(rawText(raw["distance"]))
+	if name == "" || !locationOK || !distanceOK {
+		return nearbyPOICandidate{}, false
+	}
+	candidate := nearbyPOICandidate{Name: name, Location: location, DistanceM: distance, Provider: "tianditu"}
+	candidate.TypeCode = rawText(raw["typeCode"])
+	candidate.TypeName = rawText(raw["typeName"])
+	candidate.Source = rawText(raw["source"])
+	candidate.HotPointID = rawText(raw["hotPointID"])
+	candidate.SourceID = rawText(raw["source_id"])
+	if candidate.SourceID == "" {
+		candidate.SourceID = rawText(raw["id"])
+	}
+	candidate.Province.Name, candidate.Province.Code = rawText(raw["province"]), rawText(raw["provinceCode"])
+	candidate.City.Name, candidate.City.Code = rawText(raw["city"]), rawText(raw["cityCode"])
+	candidate.County.Name, candidate.County.Code = rawText(raw["county"]), rawText(raw["countyCode"])
+	return candidate, true
+}
+
+func parseDistanceMeters(value string) (float64, bool) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	multiplier := 1.0
+	switch {
+	case strings.HasSuffix(value, "km"):
+		value, multiplier = strings.TrimSpace(strings.TrimSuffix(value, "km")), 1000
+	case strings.HasSuffix(value, "m"):
+		value = strings.TrimSpace(strings.TrimSuffix(value, "m"))
+	case strings.HasSuffix(value, "公里"):
+		value, multiplier = strings.TrimSpace(strings.TrimSuffix(value, "公里")), 1000
+	case strings.HasSuffix(value, "米"):
+		value = strings.TrimSpace(strings.TrimSuffix(value, "米"))
+	}
+	distance, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(distance) || math.IsInf(distance, 0) || distance < 0 {
+		return 0, false
+	}
+	return distance * multiplier, true
 }
 
 func makeAdministrativeDivision(level, name, code string, codeLength int) (administrativeDivision, error) {
@@ -1027,6 +1554,10 @@ func (g *gateway) cacheWrite(file string, body []byte) {
 		log.Printf("cache mkdir failed: %v", err)
 		return
 	}
+	oldSize := int64(0)
+	if fi, err := os.Stat(file); err == nil {
+		oldSize = fi.Size()
+	}
 	tmp := file + ".tmp"
 	if err := os.WriteFile(tmp, body, 0o644); err != nil {
 		log.Printf("cache write failed: %v", err)
@@ -1037,7 +1568,7 @@ func (g *gateway) cacheWrite(file string, body []byte) {
 		log.Printf("cache rename failed: %v", err)
 		return
 	}
-	g.cacheSize += int64(len(body))
+	g.cacheSize += int64(len(body)) - oldSize
 	if g.cacheSize > g.cfg.CacheMax {
 		g.evictLocked()
 	}

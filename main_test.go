@@ -173,6 +173,24 @@ func TestReverseGeocodeMunicipality(t *testing.T) {
 	}
 }
 
+func TestReverseGeocodeUsesNormalizedCoordinateCache(t *testing.T) {
+	var hits int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		fmt.Fprint(w, `{"status":"0","result":{"formatted_address":"四川省眉山市东坡区苏祠街道","addressComponent":{"nation":"中国","province":"四川省","province_code":"156510000","city":"眉山市","city_code":"156511400","county":"东坡区","county_code":"156511402","town":"苏祠街道","town_code":"156511402003"}}}`)
+	}))
+	defer up.Close()
+	g, _ := newTestGateway(t, func(c *config) { c.GeocoderUpstream = up.URL })
+	first := doGET(t, g, "/geocode/reverse?lon=103.834301&lat=30.050801", nil)
+	second := doGET(t, g, "/geocode/reverse?lon=103.834304&lat=30.050804", nil)
+	if first.Code != http.StatusOK || second.Code != http.StatusOK || atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("responses %d/%d, upstream hits %d", first.Code, second.Code, hits)
+	}
+	if second.Header().Get("X-Map-Gateway-Cache") != "hit" {
+		t.Fatalf("cache state: %q", second.Header().Get("X-Map-Gateway-Cache"))
+	}
+}
+
 func TestMunicipalityIsNotInferredFromMissingCity(t *testing.T) {
 	if !isMunicipality("重庆市") || isMunicipality("海南省") {
 		t.Fatal("municipality must be based on the four municipality names")
@@ -252,6 +270,94 @@ func TestReverseGeocodeConsistentEmptyTown(t *testing.T) {
 	}
 	if got.ResolvedLevel != "county" || got.Administrative.Town.Available || got.Administrative.Town.Level != "town" || got.Administrative.Town.Name != "" || got.Administrative.Town.Code != "" {
 		t.Fatalf("unexpected empty town contract: %+v", got)
+	}
+}
+
+func TestAdministrativeSearchKeepsProviderAreaCenterAndCaches(t *testing.T) {
+	var hits int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		if r.URL.Query().Get("type") != "query" {
+			t.Errorf("type: %q", r.URL.Query().Get("type"))
+		}
+		var post map[string]interface{}
+		if err := json.Unmarshal([]byte(r.URL.Query().Get("postStr")), &post); err != nil || post["queryType"] != float64(12) || post["specify"] != "156511402" {
+			t.Errorf("unexpected postStr: %s (%v)", r.URL.Query().Get("postStr"), err)
+		}
+		fmt.Fprint(w, `{"status":{"infocode":1000},"area":[{"name":"东坡区","lonlat":"103.8300,30.0500","bound":"103.7,29.9,104.0,30.2","adminCode":156511402,"level":3}]}`)
+	}))
+	defer up.Close()
+	g, _ := newTestGateway(t, func(c *config) { c.SearchUpstream = up.URL })
+	path := "/search/administrative?keyword=%E4%B8%9C%E5%9D%A1%E5%8C%BA&specify=156511402"
+	first := doGET(t, g, path, nil)
+	second := doGET(t, g, path, nil)
+	if first.Code != http.StatusOK || second.Code != http.StatusOK || atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("responses %d/%d, upstream hits %d", first.Code, second.Code, hits)
+	}
+	var got administrativeSearchResponse
+	if err := json.Unmarshal(first.Body.Bytes(), &got); err != nil || len(got.Candidates) != 1 {
+		t.Fatalf("bad response: %v %s", err, first.Body.String())
+	}
+	candidate := got.Candidates[0]
+	if candidate.Center == nil || candidate.Center.CenterType != "tianditu_area_center" || candidate.Raw.AdminCode != "156511402" || candidate.Raw.Bound == "" || candidate.Raw.Level != "3" {
+		t.Fatalf("provider area was not retained: %+v", candidate)
+	}
+	if second.Header().Get("X-Map-Gateway-Cache") != "hit" {
+		t.Fatalf("second call cache state: %q", second.Header().Get("X-Map-Gateway-Cache"))
+	}
+}
+
+func TestNearbySearchReturnsNumericDistanceAndCaches100Meters(t *testing.T) {
+	var hits int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		var post map[string]interface{}
+		if err := json.Unmarshal([]byte(r.URL.Query().Get("postStr")), &post); err != nil || post["queryType"] != float64(3) || post["queryRadius"] != float64(100) || post["keyWord"] != "公园" {
+			t.Errorf("unexpected postStr: %s (%v)", r.URL.Query().Get("postStr"), err)
+		}
+		fmt.Fprint(w, `{"status":{"infocode":"1000"},"pois":[{"name":"东坡湖公园","lonlat":"103.8349,30.0509","distance":"0.08km","typeCode":"110101","typeName":"公园","source":"天地图","hotPointID":"abc","source_id":"source-1","province":"四川省","provinceCode":"156510000","city":"眉山市","cityCode":"156511400","county":"东坡区","countyCode":"156511402"}]}`)
+	}))
+	defer up.Close()
+	g, _ := newTestGateway(t, func(c *config) { c.SearchUpstream = up.URL })
+	path := "/search/nearby?lon=103.8343&lat=30.0508&radius_m=100&keyword=%E5%85%AC%E5%9B%AD"
+	first := doGET(t, g, path, nil)
+	second := doGET(t, g, path, nil)
+	if first.Code != http.StatusOK || second.Code != http.StatusOK || atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("responses %d/%d, upstream hits %d", first.Code, second.Code, hits)
+	}
+	var got nearbySearchResponse
+	if err := json.Unmarshal(first.Body.Bytes(), &got); err != nil || len(got.Candidates) != 1 {
+		t.Fatalf("bad response: %v %s", err, first.Body.String())
+	}
+	candidate := got.Candidates[0]
+	if candidate.DistanceM != 80 || candidate.TypeCode != "110101" || candidate.HotPointID != "abc" || candidate.SourceID != "source-1" || candidate.County.Code != "156511402" {
+		t.Fatalf("unexpected candidate: %+v", candidate)
+	}
+	var raw map[string]interface{}
+	json.Unmarshal(first.Body.Bytes(), &raw)
+	if _, exists := raw["confidence"]; exists {
+		t.Fatal("gateway must not invent a provider confidence")
+	}
+}
+
+func TestExpiredQueryCacheIsReturnedAsStaleOnUpstreamFailure(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusBadGateway) }))
+	defer up.Close()
+	g, _ := newTestGateway(t, func(c *config) { c.SearchUpstream = up.URL })
+	key := "tianditu|" + coordinateCacheKey(103.8343, 30.0508) + "|100|公园||20"
+	entry := queryCacheEntry{
+		FetchedAt: time.Now().Add(-20 * time.Minute).UTC(),
+		ExpiresAt: time.Now().Add(-10 * time.Minute).UTC(),
+		Payload:   json.RawMessage(`{"schema_version":"1.0","provider":"tianditu","candidates":[]}`),
+	}
+	body, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.cacheWrite(g.queryCacheFile("search/nearby", key), body)
+	rec := doGET(t, g, "/search/nearby?lon=103.8343&lat=30.0508&radius_m=100&keyword=%E5%85%AC%E5%9B%AD", nil)
+	if rec.Code != http.StatusOK || rec.Header().Get("X-Map-Gateway-Cache") != "stale" {
+		t.Fatalf("got %d, cache=%q: %s", rec.Code, rec.Header().Get("X-Map-Gateway-Cache"), rec.Body.String())
 	}
 }
 

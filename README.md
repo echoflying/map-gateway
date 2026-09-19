@@ -13,10 +13,13 @@
 | `/tile/sat/{z}/{x}/{y}.jpg` | ArcGIS World Imagery | 免 KEY |
 | `/cfg/maps` | 下发天地图客户端 KEY 与直连模板（前端 Fallback 用） | — |
 | `/geocode/reverse?lon={经度}&lat={纬度}` | 天地图逆地理编码，返回全部可得行政层级 | 需要 `TIANDITU_KEY`（服务端持有） |
+| `/search/administrative?keyword=&specify=` | 天地图行政区候选及其供应商标注中心点 | 需要 `TIANDITU_KEY`（服务端持有） |
+| `/search/nearby?lon=&lat=&radius_m=&keyword=` | 天地图周边 POI 候选 | 需要 `TIANDITU_KEY`（服务端持有） |
+| `/resolve/candidates?lon=&lat=&radius_m=&keyword=` | 反查、行政区中心和周边 POI 的通用聚合结果 | 需要 `TIANDITU_KEY`（服务端持有） |
 | `/health` `/healthz` | 存活探针 | — |
 | `/admin` | 管理后台（统计 / 缓存明细） | 密码登录 |
 
-- 磁盘缓存：容量上限（默认 200MB）+ 旧文件优先淘汰（LRU，保留 80% 水位）
+- 磁盘缓存：容量上限（默认 200MB）+ 旧文件优先淘汰（LRU，保留 80% 水位）；瓦片和天地图查询共用该容量
 - 按 IP 频控（默认 600 次/分钟），返回 `429`
 - 路径严格正则校验（z≤2 位、x/y≤10 位数字），拒绝一切非瓦片路径
 - 上游超时 / 超大瓦片防护，异常返回 `502`
@@ -59,6 +62,9 @@ sudo systemctl enable --now map-gateway
 | `/health` `/healthz` | 存活探针（返回 `ok`） |
 | `/cfg/maps` | 获取天地图客户端 KEY 与三个直连上游模板（Fallback 用） |
 | `/geocode/reverse?lon={经度}&lat={纬度}` | 坐标反查完整行政区划；不接受层级参数 |
+| `/search/administrative?keyword={名称}&specify={行政区代码}` | 返回 queryType=12 的行政区候选；中心仅标为 `tianditu_area_center` |
+| `/search/nearby?lon={经度}&lat={纬度}&radius_m={米}&keyword={关键词}` | 返回 queryType=3 的附近 POI 候选；半径 1–10,000 米 |
+| `/resolve/candidates?lon=&lat=&radius_m=&keyword=` | 通用聚合接口：逆地理、行政区候选、附近 POI 候选 |
 | `/tianditu/{vec\|cva\|img\|cia}/{z}/{x}/{y}.png` | 天地图底图瓦片 |
 | `/tile/terrain/{z}/{x}/{y}.png` | AWS Terrarium 地形高程瓦片 |
 | `/tile/sat/{z}/{x}/{y}.jpg` | ArcGIS 卫星影像瓦片 |
@@ -83,9 +89,16 @@ curl -s https://x.zaitu.cn/map-gateway/cfg/maps
 
 # 逆地理编码：一次返回全部可得层级
 curl -s 'https://x.zaitu.cn/map-gateway/geocode/reverse?lon=103.8343&lat=30.0508'
+
+# 行政区候选中心。specify 使用天地图行政区代码。
+curl -s 'https://x.zaitu.cn/map-gateway/search/administrative?keyword=%E4%B8%9C%E5%9D%A1%E5%8C%BA&specify=156511402'
+
+# 100 米附近的“公园”候选。keyword 必填，网关不杜撰 POI 名称。
+curl -s 'https://x.zaitu.cn/map-gateway/search/nearby?lon=103.8343&lat=30.0508&radius_m=100&keyword=%E5%85%AC%E5%9B%AD'
 ```
 
 逆地理编码的完整契约、直辖市规则和降级语义见 [docs/REVERSE_GEOCODING.md](docs/REVERSE_GEOCODING.md)。
+通用行政区中心、周边 POI、缓存和聚合接口见 [docs/SEARCH_CANDIDATES.md](docs/SEARCH_CANDIDATES.md)。
 
 ### 调用约束
 
@@ -113,6 +126,7 @@ go test ./...
 main.go                 代理与缓存实现
 docs/FALLBACK_MANUAL.md Fallback 直连容灾手册
 docs/REVERSE_GEOCODING.md 逆地理编码接口契约
+docs/SEARCH_CANDIDATES.md 通用行政区中心与周边 POI 契约
 data/admin-divisions.tsv 中国省/市/区县/乡镇街道四级权威目录
 deploy/                 systemd 服务文件与脚本
 .env.example            环境变量模板（占位符）
