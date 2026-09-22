@@ -32,9 +32,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -116,6 +118,8 @@ type config struct {
 	UpstreamTimeout      time.Duration
 	MaxTileBytes         int64
 	TiandituKey          string
+	AccessTokenSecret    string
+	TokenIssuerKey       string
 	EnvFile              string
 	AdminDivisionsFile   string
 	AdminDivisionsSHA256 string
@@ -173,6 +177,8 @@ func configFromEnv() config {
 	cfg.ListenAddr = firstNonEmpty(get("MAP_LISTEN_ADDR"), cfg.ListenAddr)
 	cfg.CacheDir = firstNonEmpty(get("MAP_CACHE_DIR"), cfg.CacheDir)
 	cfg.TiandituKey = get("TIANDITU_KEY")
+	cfg.AccessTokenSecret = get("MAP_ACCESS_TOKEN_SECRET")
+	cfg.TokenIssuerKey = get("MAP_TOKEN_ISSUER_KEY")
 	cfg.AdminDivisionsFile = firstNonEmpty(get("MAP_ADMIN_DIVISIONS_FILE"), cfg.AdminDivisionsFile)
 	cfg.AdminUser = firstNonEmpty(get("MAP_ADMIN_USER"), cfg.AdminUser)
 	cfg.AdminPass = firstNonEmpty(get("MAP_ADMIN_PASS"), cfg.AdminPass)
@@ -400,11 +406,19 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	rec := &statusRecorder{ResponseWriter: w}
 	path := r.URL.Path
+	if path == "/auth/token" && r.Method == http.MethodPost {
+		g.handleTokenIssue(rec, r)
+		goto done
+	}
 	if isPublicPath(path) {
 		setPublicCORS(rec)
 		if r.Method == http.MethodOptions {
 			rec.Header().Set("Cache-Control", "no-store")
 			rec.WriteHeader(http.StatusNoContent)
+			goto done
+		}
+		if g.accessControlEnabled() && isTokenProtectedPath(path) && !g.validAccessToken(r) {
+			http.Error(rec, "valid access_token required", http.StatusUnauthorized)
 			goto done
 		}
 	}
@@ -483,6 +497,64 @@ func setPublicCORS(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Max-Age", "86400")
 }
 
+func isTokenProtectedPath(path string) bool {
+	return path != "/help" && path != "/health" && path != "/healthz"
+}
+
+func (g *gateway) accessControlEnabled() bool {
+	return g.cfg.AccessTokenSecret != "" && g.cfg.TokenIssuerKey != ""
+}
+
+// Access tokens are opaque, short-lived HMAC values. The signing secret stays
+// on Raven; the issuer key is the only long-lived value a trusted app server
+// needs to call /auth/token.
+func (g *gateway) handleTokenIssue(w http.ResponseWriter, r *http.Request) {
+	if !g.accessControlEnabled() {
+		http.Error(w, "access-token issuance is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Map-Gateway-Issuer-Key")), []byte(g.cfg.TokenIssuerKey)) != 1 {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	expires := time.Now().UTC().Add(10 * time.Minute)
+	var nonce [18]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		http.Error(w, "token generation failed", http.StatusInternalServerError)
+		return
+	}
+	payload := "v1." + strconv.FormatInt(expires.Unix(), 10) + "." + base64.RawURLEncoding.EncodeToString(nonce[:])
+	mac := hmac.New(sha256.New, []byte(g.cfg.AccessTokenSecret))
+	mac.Write([]byte(payload))
+	token := payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(map[string]interface{}{"access_token": token, "expires_at": expires.Format(time.RFC3339), "token_type": "map-gateway"})
+}
+
+func (g *gateway) validAccessToken(r *http.Request) bool {
+	token := r.URL.Query().Get("access_token")
+	if token == "" {
+		token = strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	}
+	parts := strings.Split(token, ".")
+	if len(parts) != 4 || parts[0] != "v1" {
+		return false
+	}
+	expires, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || time.Now().Unix() >= expires {
+		return false
+	}
+	payload := strings.Join(parts[:3], ".")
+	provided, err := base64.RawURLEncoding.DecodeString(parts[3])
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(g.cfg.AccessTokenSecret))
+	mac.Write([]byte(payload))
+	return hmac.Equal(provided, mac.Sum(nil))
+}
+
 type agentHelpParameter struct {
 	Name     string `json:"name"`
 	Required bool   `json:"required"`
@@ -505,7 +577,9 @@ type agentHelpResponse struct {
 	Audience      string              `json:"audience"`
 	PublicBaseURL string              `json:"public_base_url"`
 	Rules         []string            `json:"rules"`
+	AccessControl string              `json:"access_control"`
 	Endpoints     []agentHelpEndpoint `json:"endpoints"`
+	Issuer        agentHelpEndpoint   `json:"issuer"`
 	Admin         []agentHelpEndpoint `json:"admin,omitempty"`
 }
 
@@ -516,6 +590,7 @@ func (g *gateway) handleAgentHelp(w http.ResponseWriter, r *http.Request) {
 		SchemaVersion: "1.0",
 		Audience:      "agents",
 		PublicBaseURL: "https://x.zaitu.cn/map-gateway",
+		AccessControl: "disabled: set MAP_ACCESS_TOKEN_SECRET and MAP_TOKEN_ISSUER_KEY on Raven to require browser/API access tokens",
 		Rules: []string{
 			"Use HTTPS and paths relative to public_base_url. All public data routes are GET only.",
 			"Public data routes allow cross-origin GET and OPTIONS with Access-Control-Allow-Origin: *. Administrative routes do not allow CORS.",
@@ -575,12 +650,16 @@ func (g *gateway) handleAgentHelp(w http.ResponseWriter, r *http.Request) {
 				Returns: []string{"legacy frontend configuration"}, Constraints: []string{"Agents must use gateway proxy routes and must not use this response to call providers directly."},
 			},
 		},
+		Issuer: agentHelpEndpoint{Path: "/auth/token", Method: "POST", Purpose: "Trusted-server-only short-lived browser/API token issuance.", Cache: "no-store", Parameters: []agentHelpParameter{{Name: "X-Map-Gateway-Issuer-Key", Required: true, Format: "request header; long-lived shared issuer key"}}, Returns: []string{"access_token", "expires_at", "token_type"}, Constraints: []string{"No CORS.", "Only works after MAP_ACCESS_TOKEN_SECRET and MAP_TOKEN_ISSUER_KEY are configured on Raven.", "Never expose the issuer key to a browser."}},
 		Admin: []agentHelpEndpoint{
 			{Path: "/admin", Method: "GET", Purpose: "Human administration UI; not for agent integration.", Cache: "no-store", Returns: []string{"HTML; authenticated session required"}},
 			{Path: "/admin/login", Method: "POST", Purpose: "Administration session login; not for agent integration.", Cache: "no-store", Returns: []string{"session cookie"}},
 			{Path: "/admin/logout", Method: "POST", Purpose: "Administration session logout; not for agent integration.", Cache: "no-store", Returns: []string{"session cleared"}},
 			{Path: "/admin/api/stats", Method: "GET", Purpose: "Administration statistics; authenticated session required.", Cache: "no-store", Returns: []string{"JSON statistics"}},
 		},
+	}
+	if g.accessControlEnabled() {
+		help.AccessControl = "enabled: data routes require a valid short-lived access_token query parameter or Authorization: Bearer token; /help and health probes remain open"
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -1566,7 +1645,7 @@ func isMunicipality(province string) bool {
 // ---------------------------------------------------------------------------
 
 func (g *gateway) handleTile(w http.ResponseWriter, r *http.Request) {
-	if !tilePathOnly(r) {
+	if !g.tilePathOnly(r) {
 		http.NotFound(w, r)
 		return
 	}
@@ -1638,7 +1717,7 @@ func (g *gateway) handleMapConfig(w http.ResponseWriter, r *http.Request) {
 func (g *gateway) handleTianditu(w http.ResponseWriter, r *http.Request) {
 	// Query strings are rejected before the key check too: the route itself
 	// is invalid, so even a key-less or key-ful request must 404.
-	if !tilePathOnly(r) {
+	if !g.tilePathOnly(r) {
 		http.NotFound(w, r)
 		return
 	}
@@ -1677,8 +1756,13 @@ func (g *gateway) handleTianditu(w http.ResponseWriter, r *http.Request) {
 // tilePathOnly reports whether the request carries no query string. Tile
 // URLs are path-only, so any query string is rejected before rate limiting,
 // cache or upstream handling (ForceQuery covers a bare trailing '?').
-func tilePathOnly(r *http.Request) bool {
-	return r.URL.RawQuery == "" && !r.URL.ForceQuery
+func (g *gateway) tilePathOnly(r *http.Request) bool {
+	if r.URL.RawQuery == "" && !r.URL.ForceQuery {
+		return true
+	}
+	// Browser <img> requests cannot carry Authorization. When token protection
+	// is enabled, access_token is the sole permitted tile query parameter.
+	return g.accessControlEnabled() && len(r.URL.Query()) == 1 && r.URL.Query().Get("access_token") != ""
 }
 
 // validTile verifies z/x/y parsed from the numeric regex are sane.
