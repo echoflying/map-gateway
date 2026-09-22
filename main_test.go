@@ -136,6 +136,28 @@ func TestAgentHelpListsEveryAgentCallableEndpoint(t *testing.T) {
 	}
 }
 
+func TestPublicCORSPermitsGetAndOptionsButNotAdmin(t *testing.T) {
+	g, _ := newTestGateway(t, nil)
+	for _, method := range []string{http.MethodGet, http.MethodOptions} {
+		req := httptest.NewRequest(method, "/tile/terrain/3/6/2.png", nil)
+		req.Header.Set("Origin", "https://piboy.xyz")
+		rec := httptest.NewRecorder()
+		g.ServeHTTP(rec, req)
+		if rec.Header().Get("Access-Control-Allow-Origin") != "*" || rec.Header().Get("Access-Control-Allow-Methods") != "GET, OPTIONS" {
+			t.Fatalf("%s missing CORS headers: %+v", method, rec.Header())
+		}
+		if method == http.MethodOptions && rec.Code != http.StatusNoContent {
+			t.Fatalf("OPTIONS got %d, want 204", rec.Code)
+		}
+	}
+	adminReq := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	adminRec := httptest.NewRecorder()
+	g.ServeHTTP(adminRec, adminReq)
+	if adminRec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("admin must not have public CORS: %+v", adminRec.Header())
+	}
+}
+
 func TestNoKeyEndpointAndUnknownRoutes(t *testing.T) {
 	g, _ := newTestGateway(t, nil)
 	for _, p := range []string{

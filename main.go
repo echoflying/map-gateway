@@ -400,6 +400,14 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	rec := &statusRecorder{ResponseWriter: w}
 	path := r.URL.Path
+	if isPublicPath(path) {
+		setPublicCORS(rec)
+		if r.Method == http.MethodOptions {
+			rec.Header().Set("Cache-Control", "no-store")
+			rec.WriteHeader(http.StatusNoContent)
+			goto done
+		}
+	}
 	switch {
 	case path == "/admin/login" && r.Method == http.MethodPost:
 		g.handleAdminLogin(w, r)
@@ -458,6 +466,23 @@ done:
 	}
 }
 
+// isPublicPath deliberately excludes /admin. Public map resources are safe to
+// embed from another origin and terrain pixels must be readable by canvas.
+func isPublicPath(path string) bool {
+	switch path {
+	case "/help", "/health", "/healthz", "/cfg/maps", "/geocode/reverse", "/search/administrative", "/search/nearby", "/resolve/candidates":
+		return true
+	}
+	return strings.HasPrefix(path, "/tile/") || strings.HasPrefix(path, "/tianditu/")
+}
+
+func setPublicCORS(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Max-Age", "86400")
+}
+
 type agentHelpParameter struct {
 	Name     string `json:"name"`
 	Required bool   `json:"required"`
@@ -493,6 +518,7 @@ func (g *gateway) handleAgentHelp(w http.ResponseWriter, r *http.Request) {
 		PublicBaseURL: "https://x.zaitu.cn/map-gateway",
 		Rules: []string{
 			"Use HTTPS and paths relative to public_base_url. All public data routes are GET only.",
+			"Public data routes allow cross-origin GET and OPTIONS with Access-Control-Allow-Origin: *. Administrative routes do not allow CORS.",
 			"Do not call external map providers directly. Do not expect any upstream credential in a response.",
 			"Treat candidate arrays as candidates, not facts. center_type distinguishes an area center from a named POI center.",
 			"Use response.cache.state and X-Map-Gateway-Cache: miss|hit|stale. stale is a previous successful provider result.",
