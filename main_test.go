@@ -103,6 +103,39 @@ func TestHealthEndpoints(t *testing.T) {
 	}
 }
 
+func TestAgentHelpListsEveryAgentCallableEndpoint(t *testing.T) {
+	g, _ := newTestGateway(t, nil)
+	rec := doGET(t, g, "/help", nil)
+	if rec.Code != http.StatusOK || !strings.HasPrefix(rec.Header().Get("Content-Type"), "application/json") || rec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("unexpected help response: %d, %q, %q", rec.Code, rec.Header().Get("Content-Type"), rec.Header().Get("Cache-Control"))
+	}
+	var help agentHelpResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &help); err != nil {
+		t.Fatal(err)
+	}
+	if help.SchemaVersion != "1.0" || help.Audience != "agents" || help.PublicBaseURL != "https://x.zaitu.cn/map-gateway" {
+		t.Fatalf("unexpected help metadata: %+v", help)
+	}
+	want := map[string]bool{
+		"/help": false, "/health": false, "/geocode/reverse": false, "/search/administrative": false,
+		"/search/nearby": false, "/resolve/candidates": false, "/cfg/maps": false,
+		"/tianditu/{vec|cva|img|cia}/{z}/{x}/{y}.png": false, "/tile/terrain/{z}/{x}/{y}.png": false, "/tile/sat/{z}/{x}/{y}.jpg": false,
+	}
+	for _, endpoint := range help.Endpoints {
+		if _, exists := want[endpoint.Path]; exists {
+			want[endpoint.Path] = true
+		}
+	}
+	for path, found := range want {
+		if !found {
+			t.Errorf("help is missing %s", path)
+		}
+	}
+	if len(help.Admin) != 4 || !strings.Contains(strings.Join(help.Rules, " "), "Do not call external map providers directly") {
+		t.Fatalf("help lacks admin or proxy rules: %+v", help)
+	}
+}
+
 func TestNoKeyEndpointAndUnknownRoutes(t *testing.T) {
 	g, _ := newTestGateway(t, nil)
 	for _, p := range []string{

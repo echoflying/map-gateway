@@ -16,6 +16,7 @@
 | `/search/administrative?keyword=&specify=` | 天地图行政区候选及其供应商标注中心点 | 需要 `TIANDITU_KEY`（服务端持有） |
 | `/search/nearby?lon=&lat=&radius_m=&keyword=` | 天地图周边 POI 候选 | 需要 `TIANDITU_KEY`（服务端持有） |
 | `/resolve/candidates?lon=&lat=&radius_m=&keyword=` | 反查、行政区中心和周边 POI 的通用聚合结果 | 需要 `TIANDITU_KEY`（服务端持有） |
+| `/help` | 面向 Agent 的机器可读接口契约与调用约束 | — |
 | `/health` `/healthz` | 存活探针 | — |
 | `/admin` | 管理后台（统计 / 缓存明细） | 密码登录 |
 
@@ -60,6 +61,7 @@ sudo systemctl enable --now map-gateway
 | 路由 | 用途 |
 |------|------|
 | `/health` `/healthz` | 存活探针（返回 `ok`） |
+| `/help` | Agent 优先读取的 JSON 接口目录：参数、缓存、响应字段与调用约束 |
 | `/cfg/maps` | 获取天地图客户端 KEY 与三个直连上游模板（Fallback 用） |
 | `/geocode/reverse?lon={经度}&lat={纬度}` | 坐标反查完整行政区划；不接受层级参数 |
 | `/search/administrative?keyword={名称}&specify={行政区代码}` | 返回 queryType=12 的行政区候选；明确区分 `tianditu_area_center` 与同名 POI 中心 |
@@ -72,6 +74,9 @@ sudo systemctl enable --now map-gateway
 ### 示例（相对路径，同源即可用）
 
 ```bash
+# Agent 接入前先读取此 JSON 契约；不要直连任何地图上游。
+curl -s https://x.zaitu.cn/map-gateway/help
+
 # 存活探针
 curl -s https://x.zaitu.cn/map-gateway/health
 

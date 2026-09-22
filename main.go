@@ -5,6 +5,7 @@
 //
 // Routes (GET only, browser-compatible):
 //
+//	/help                                      -> agent-readable API contract
 //	/health, /healthz                          -> "ok" (systemd / probes)
 //	/geocode/reverse?lon={lon}&lat={lat}        -> Tianditu reverse geocoding
 //	/tile/terrain/{z}/{x}/{y}.png              -> AWS Terrarium elevation tiles
@@ -421,6 +422,8 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method != http.MethodGet:
 		rec.Header().Set("Allow", "GET")
 		http.Error(rec, "method not allowed", http.StatusMethodNotAllowed)
+	case path == "/help":
+		g.handleAgentHelp(rec, r)
 	case path == "/health" || path == "/healthz":
 		rec.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		rec.Header().Set("Cache-Control", "no-store")
@@ -444,7 +447,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(rec, r)
 	}
 	// Admin routes are recorded inside their handlers; tiles are recorded here.
-	if strings.HasPrefix(path, "/tile/") || strings.HasPrefix(path, "/tianditu/") || path == "/geocode/reverse" || path == "/search/administrative" || path == "/search/nearby" || path == "/resolve/candidates" {
+	if strings.HasPrefix(path, "/tile/") || strings.HasPrefix(path, "/tianditu/") || path == "/geocode/reverse" || path == "/search/administrative" || path == "/search/nearby" || path == "/resolve/candidates" || path == "/help" {
 		g.recordRequest(path, rec.status, rec.written, time.Since(start), "", r.Header.Get("Referer"))
 	}
 done:
@@ -453,6 +456,109 @@ done:
 		log.Printf("%s %s -> %d (%dB) %s", r.Method, path, rec.status, rec.written,
 			time.Since(start).Round(time.Millisecond))
 	}
+}
+
+type agentHelpParameter struct {
+	Name     string `json:"name"`
+	Required bool   `json:"required"`
+	Format   string `json:"format"`
+	Note     string `json:"note,omitempty"`
+}
+
+type agentHelpEndpoint struct {
+	Path        string               `json:"path"`
+	Method      string               `json:"method"`
+	Purpose     string               `json:"purpose"`
+	Parameters  []agentHelpParameter `json:"parameters,omitempty"`
+	Cache       string               `json:"cache"`
+	Returns     []string             `json:"returns"`
+	Constraints []string             `json:"constraints,omitempty"`
+}
+
+type agentHelpResponse struct {
+	SchemaVersion string              `json:"schema_version"`
+	Audience      string              `json:"audience"`
+	PublicBaseURL string              `json:"public_base_url"`
+	Rules         []string            `json:"rules"`
+	Endpoints     []agentHelpEndpoint `json:"endpoints"`
+	Admin         []agentHelpEndpoint `json:"admin,omitempty"`
+}
+
+// handleAgentHelp is deliberately JSON-first. It is a compact contract
+// discovery document for agents; it contains no credential or upstream URL.
+func (g *gateway) handleAgentHelp(w http.ResponseWriter, r *http.Request) {
+	help := agentHelpResponse{
+		SchemaVersion: "1.0",
+		Audience:      "agents",
+		PublicBaseURL: "https://x.zaitu.cn/map-gateway",
+		Rules: []string{
+			"Use HTTPS and paths relative to public_base_url. All public data routes are GET only.",
+			"Do not call external map providers directly. Do not expect any upstream credential in a response.",
+			"Treat candidate arrays as candidates, not facts. center_type distinguishes an area center from a named POI center.",
+			"Use response.cache.state and X-Map-Gateway-Cache: miss|hit|stale. stale is a previous successful provider result.",
+			"Coordinates are WGS84 longitude/latitude. distance_m is a WGS84 great-circle distance in metres.",
+		},
+		Endpoints: []agentHelpEndpoint{
+			{
+				Path: "/help", Method: "GET", Purpose: "Machine-readable API contract discovery.", Cache: "no-store",
+				Returns: []string{"schema_version", "rules", "endpoints", "admin"},
+			},
+			{
+				Path: "/health", Method: "GET", Purpose: "Liveness probe; /healthz is an alias.", Cache: "no-store",
+				Returns: []string{"text/plain: ok"},
+			},
+			{
+				Path: "/geocode/reverse", Method: "GET", Purpose: "Reverse geocode into the complete available China administrative hierarchy.", Cache: "gateway disk cache, 30 days, normalized 5-decimal coordinate grid",
+				Parameters:  []agentHelpParameter{{Name: "lon", Required: true, Format: "float [-180,180]"}, {Name: "lat", Required: true, Format: "float [-90,90]"}},
+				Returns:     []string{"location", "formattedAddress", "administrative.country|province|city|county|town|village", "municipality", "resolvedLevel", "cache"},
+				Constraints: []string{"No level selector: callers choose a returned level.", "For Beijing/Shanghai/Tianjin/Chongqing, municipality=true and city may be unavailable; use county normally."},
+			},
+			{
+				Path: "/search/administrative", Method: "GET", Purpose: "Find an administrative center candidate through Tianditu queryType=12.", Cache: "gateway disk cache, 7 days; key includes provider, admin code, request keyword, origin grid and limit",
+				Parameters:  []agentHelpParameter{{Name: "keyword", Required: true, Format: "string, <=100 runes"}, {Name: "specify", Required: true, Format: "9-digit Tianditu national code, e.g. 156511402"}, {Name: "origin_lon", Required: false, Format: "float [-180,180]", Note: "must be supplied with origin_lat"}, {Name: "origin_lat", Required: false, Format: "float [-90,90]", Note: "must be supplied with origin_lon"}, {Name: "limit", Required: false, Format: "integer 1..50, default 20"}},
+				Returns:     []string{"candidates[].name", "candidates[].admin_code", "candidates[].level", "candidates[].center.location", "candidates[].center.center_type", "candidates[].center.distance_m when origin is supplied", "candidates[].raw", "cache"},
+				Constraints: []string{"center_type=tianditu_area_center only when the provider returns area.lonlat.", "center_type=tianditu_named_poi is a strict provider POI name match; it is neither an area centroid nor a government-seat claim.", "An empty candidates array is valid."},
+			},
+			{
+				Path: "/search/nearby", Method: "GET", Purpose: "Find nearby POI candidates through Tianditu queryType=3.", Cache: "gateway disk cache, 10 minutes; key includes provider, normalized coordinate grid, radius, keyword, data_types and limit",
+				Parameters:  []agentHelpParameter{{Name: "lon", Required: true, Format: "float [-180,180]"}, {Name: "lat", Required: true, Format: "float [-90,90]"}, {Name: "radius_m", Required: true, Format: "float (0,10000]"}, {Name: "keyword", Required: true, Format: "string, <=100 runes"}, {Name: "data_types", Required: false, Format: "Tianditu category string, <=200 runes"}, {Name: "limit", Required: false, Format: "integer 1..50, default 20"}},
+				Returns:     []string{"location", "query_radius_m", "candidates[].name", "candidates[].location", "candidates[].distance_m", "type_code", "type_name", "provider", "source", "hotPointID", "source_id", "province|city|county", "cache"},
+				Constraints: []string{"keyword is mandatory; empty candidates are returned instead of invented POI names.", "No confidence is fabricated when the provider has none."},
+			},
+			{
+				Path: "/resolve/candidates", Method: "GET", Purpose: "One-call composition of reverse geocoding, compatible county-or-higher administrative center candidate and nearby POI candidates.", Cache: "gateway disk cache, 10 minutes; key includes provider, normalized coordinate grid, radius, keyword, data_types and limit",
+				Parameters:  []agentHelpParameter{{Name: "lon", Required: true, Format: "float [-180,180]"}, {Name: "lat", Required: true, Format: "float [-90,90]"}, {Name: "radius_m", Required: true, Format: "float (0,10000]"}, {Name: "keyword", Required: true, Format: "string, <=100 runes"}, {Name: "data_types", Required: false, Format: "Tianditu category string, <=200 runes"}, {Name: "limit", Required: false, Format: "integer 1..50, default 20"}},
+				Returns:     []string{"reverse_geocode", "administrative_candidates[].center.distance_m", "poi_candidates", "cache"},
+				Constraints: []string{"Administrative center selection is county, then city, then province because Tianditu queryType=12 accepts 9-digit national codes, not 12-digit town codes."},
+			},
+			{
+				Path: "/tianditu/{vec|cva|img|cia}/{z}/{x}/{y}.png", Method: "GET", Purpose: "Proxy a Tianditu WMTS map tile.", Cache: "gateway disk cache, bounded shared capacity",
+				Parameters: []agentHelpParameter{{Name: "z", Required: true, Format: "integer 0..18, path segment"}, {Name: "x", Required: true, Format: "non-negative integer, path segment"}, {Name: "y", Required: true, Format: "non-negative integer, path segment"}},
+				Returns:    []string{"image/png"}, Constraints: []string{"No query string is accepted."},
+			},
+			{
+				Path: "/tile/terrain/{z}/{x}/{y}.png", Method: "GET", Purpose: "Proxy an AWS Terrarium elevation tile.", Cache: "gateway disk cache, bounded shared capacity",
+				Parameters: []agentHelpParameter{{Name: "z/x/y", Required: true, Format: "tile path segments"}}, Returns: []string{"image/png"}, Constraints: []string{"No query string is accepted."},
+			},
+			{
+				Path: "/tile/sat/{z}/{x}/{y}.jpg", Method: "GET", Purpose: "Proxy an ArcGIS satellite tile; .png is also accepted for compatibility.", Cache: "gateway disk cache, bounded shared capacity",
+				Parameters: []agentHelpParameter{{Name: "z/x/y", Required: true, Format: "tile path segments"}}, Returns: []string{"image/jpeg or image/png"}, Constraints: []string{"No query string is accepted."},
+			},
+			{
+				Path: "/cfg/maps", Method: "GET", Purpose: "Legacy browser fallback configuration, not an agent integration API.", Cache: "no-store",
+				Returns: []string{"legacy frontend configuration"}, Constraints: []string{"Agents must use gateway proxy routes and must not use this response to call providers directly."},
+			},
+		},
+		Admin: []agentHelpEndpoint{
+			{Path: "/admin", Method: "GET", Purpose: "Human administration UI; not for agent integration.", Cache: "no-store", Returns: []string{"HTML; authenticated session required"}},
+			{Path: "/admin/login", Method: "POST", Purpose: "Administration session login; not for agent integration.", Cache: "no-store", Returns: []string{"session cookie"}},
+			{Path: "/admin/logout", Method: "POST", Purpose: "Administration session logout; not for agent integration.", Cache: "no-store", Returns: []string{"session cleared"}},
+			{Path: "/admin/api/stats", Method: "GET", Purpose: "Administration statistics; authenticated session required.", Cache: "no-store", Returns: []string{"JSON statistics"}},
+		},
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(help)
 }
 
 type administrativeDivision struct {
