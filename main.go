@@ -694,6 +694,7 @@ func (g *gateway) handleAgentHelp(w http.ResponseWriter, r *http.Request) {
 			"Use response.cache.state and X-Map-Gateway-Cache: miss|hit|stale. stale is a previous successful provider result.",
 			"Coordinates are WGS84 longitude/latitude. distance_m is a WGS84 great-circle distance in metres.",
 			"Authentication: when enabled, obtain a token from /auth/token (see issuer) and present it as Authorization: Bearer. Tiles additionally accept ?access_token=; data APIs reject access_token as a query parameter.",
+			"推荐集成方式：由受信业务后端调用 /auth/token 领取令牌（签发接口仅服务端可用、无 CORS），随后后端自行代理瓦片/数据请求（浏览器全程不接触令牌），或将 10 分钟短期令牌下发给自有前端携带使用；令牌有效期内可复用于大量请求，无需逐请求领取。签发密钥严禁放入客户端代码。",
 		},
 		Endpoints: []agentHelpEndpoint{
 			{
