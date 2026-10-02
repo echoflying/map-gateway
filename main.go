@@ -598,6 +598,7 @@ func (g *gateway) handleAgentHelp(w http.ResponseWriter, r *http.Request) {
 			"Treat candidate arrays as candidates, not facts. center_type distinguishes an area center from a named POI center.",
 			"Use response.cache.state and X-Map-Gateway-Cache: miss|hit|stale. stale is a previous successful provider result.",
 			"Coordinates are WGS84 longitude/latitude. distance_m is a WGS84 great-circle distance in metres.",
+			"Authentication: when enabled, obtain a token from /auth/token (see issuer) and present it as Authorization: Bearer. Tiles additionally accept ?access_token=; data APIs reject access_token as a query parameter.",
 		},
 		Endpoints: []agentHelpEndpoint{
 			{
@@ -612,45 +613,45 @@ func (g *gateway) handleAgentHelp(w http.ResponseWriter, r *http.Request) {
 				Path: "/geocode/reverse", Method: "GET", Purpose: "Reverse geocode into the complete available China administrative hierarchy.", Cache: "gateway disk cache, 30 days, normalized 5-decimal coordinate grid",
 				Parameters:  []agentHelpParameter{{Name: "lon", Required: true, Format: "float [-180,180]"}, {Name: "lat", Required: true, Format: "float [-90,90]"}},
 				Returns:     []string{"location", "formattedAddress", "administrative.country|province|city|county|town|village", "municipality", "resolvedLevel", "cache"},
-				Constraints: []string{"No level selector: callers choose a returned level.", "For Beijing/Shanghai/Tianjin/Chongqing, municipality=true and city may be unavailable; use county normally."},
+				Constraints: []string{"No level selector: callers choose a returned level.", "For Beijing/Shanghai/Tianjin/Chongqing, municipality=true and city may be unavailable; use county normally.", "Requires a valid access_token via Authorization: Bearer header only when token issuance is enabled; access_token as a query parameter is rejected."},
 			},
 			{
 				Path: "/search/administrative", Method: "GET", Purpose: "Find an administrative center candidate through Tianditu queryType=12.", Cache: "gateway disk cache, 7 days; key includes provider, admin code, request keyword, origin grid and limit",
 				Parameters:  []agentHelpParameter{{Name: "keyword", Required: true, Format: "string, <=100 runes"}, {Name: "specify", Required: true, Format: "9-digit Tianditu national code, e.g. 156511402"}, {Name: "origin_lon", Required: false, Format: "float [-180,180]", Note: "must be supplied with origin_lat"}, {Name: "origin_lat", Required: false, Format: "float [-90,90]", Note: "must be supplied with origin_lon"}, {Name: "limit", Required: false, Format: "integer 1..50, default 20"}},
 				Returns:     []string{"candidates[].name", "candidates[].admin_code", "candidates[].level", "candidates[].center.location", "candidates[].center.center_type", "candidates[].center.distance_m when origin is supplied", "candidates[].raw", "cache"},
-				Constraints: []string{"center_type=tianditu_area_center only when the provider returns area.lonlat.", "center_type=tianditu_named_poi is a strict provider POI name match; it is neither an area centroid nor a government-seat claim.", "An empty candidates array is valid."},
+				Constraints: []string{"center_type=tianditu_area_center only when the provider returns area.lonlat.", "center_type=tianditu_named_poi is a strict provider POI name match; it is neither an area centroid nor a government-seat claim.", "An empty candidates array is valid.", "Requires a valid access_token via Authorization: Bearer header only when token issuance is enabled; access_token as a query parameter is rejected."},
 			},
 			{
 				Path: "/search/nearby", Method: "GET", Purpose: "Find nearby POI candidates through Tianditu queryType=3.", Cache: "gateway disk cache, 10 minutes; key includes provider, normalized coordinate grid, radius, keyword, data_types and limit",
 				Parameters:  []agentHelpParameter{{Name: "lon", Required: true, Format: "float [-180,180]"}, {Name: "lat", Required: true, Format: "float [-90,90]"}, {Name: "radius_m", Required: true, Format: "float (0,10000]"}, {Name: "keyword", Required: true, Format: "string, <=100 runes"}, {Name: "data_types", Required: false, Format: "Tianditu category string, <=200 runes"}, {Name: "limit", Required: false, Format: "integer 1..50, default 20"}},
 				Returns:     []string{"location", "query_radius_m", "candidates[].name", "candidates[].location", "candidates[].distance_m", "type_code", "type_name", "provider", "source", "hotPointID", "source_id", "province|city|county", "cache"},
-				Constraints: []string{"keyword is mandatory; empty candidates are returned instead of invented POI names.", "No confidence is fabricated when the provider has none."},
+				Constraints: []string{"keyword is mandatory; empty candidates are returned instead of invented POI names.", "No confidence is fabricated when the provider has none.", "Requires a valid access_token via Authorization: Bearer header only when token issuance is enabled; access_token as a query parameter is rejected."},
 			},
 			{
 				Path: "/resolve/candidates", Method: "GET", Purpose: "One-call composition of reverse geocoding, compatible county-or-higher administrative center candidate and nearby POI candidates.", Cache: "gateway disk cache, 10 minutes; key includes provider, normalized coordinate grid, radius, keyword, data_types and limit",
 				Parameters:  []agentHelpParameter{{Name: "lon", Required: true, Format: "float [-180,180]"}, {Name: "lat", Required: true, Format: "float [-90,90]"}, {Name: "radius_m", Required: true, Format: "float (0,10000]"}, {Name: "keyword", Required: true, Format: "string, <=100 runes"}, {Name: "data_types", Required: false, Format: "Tianditu category string, <=200 runes"}, {Name: "limit", Required: false, Format: "integer 1..50, default 20"}},
 				Returns:     []string{"reverse_geocode", "administrative_candidates[].center.distance_m", "poi_candidates", "cache"},
-				Constraints: []string{"Administrative center selection is county, then city, then province because Tianditu queryType=12 accepts 9-digit national codes, not 12-digit town codes."},
+				Constraints: []string{"Administrative center selection is county, then city, then province because Tianditu queryType=12 accepts 9-digit national codes, not 12-digit town codes.", "Requires a valid access_token via Authorization: Bearer header only when token issuance is enabled; access_token as a query parameter is rejected."},
 			},
 			{
 				Path: "/tianditu/{vec|cva|img|cia}/{z}/{x}/{y}.png", Method: "GET", Purpose: "Proxy a Tianditu WMTS map tile.", Cache: "gateway disk cache, bounded shared capacity",
 				Parameters: []agentHelpParameter{{Name: "z", Required: true, Format: "integer 0..18, path segment"}, {Name: "x", Required: true, Format: "non-negative integer, path segment"}, {Name: "y", Required: true, Format: "non-negative integer, path segment"}},
-				Returns:    []string{"image/png"}, Constraints: []string{"No query string is accepted."},
+				Returns:    []string{"image/png"}, Constraints: []string{"Only the access_token query parameter is accepted when token issuance is enabled."},
 			},
 			{
 				Path: "/tile/terrain/{z}/{x}/{y}.png", Method: "GET", Purpose: "Proxy an AWS Terrarium elevation tile.", Cache: "gateway disk cache, bounded shared capacity",
-				Parameters: []agentHelpParameter{{Name: "z/x/y", Required: true, Format: "tile path segments"}}, Returns: []string{"image/png"}, Constraints: []string{"No query string is accepted."},
+				Parameters: []agentHelpParameter{{Name: "z/x/y", Required: true, Format: "tile path segments"}}, Returns: []string{"image/png"}, Constraints: []string{"Only the access_token query parameter is accepted when token issuance is enabled."},
 			},
 			{
 				Path: "/tile/sat/{z}/{x}/{y}.jpg", Method: "GET", Purpose: "Proxy an ArcGIS satellite tile; .png is also accepted for compatibility.", Cache: "gateway disk cache, bounded shared capacity",
-				Parameters: []agentHelpParameter{{Name: "z/x/y", Required: true, Format: "tile path segments"}}, Returns: []string{"image/jpeg or image/png"}, Constraints: []string{"No query string is accepted."},
+				Parameters: []agentHelpParameter{{Name: "z/x/y", Required: true, Format: "tile path segments"}}, Returns: []string{"image/jpeg or image/png"}, Constraints: []string{"Only the access_token query parameter is accepted when token issuance is enabled."},
 			},
 			{
 				Path: "/cfg/maps", Method: "GET", Purpose: "Legacy browser fallback configuration, not an agent integration API.", Cache: "no-store",
-				Returns: []string{"legacy frontend configuration"}, Constraints: []string{"Agents must use gateway proxy routes and must not use this response to call providers directly."},
+				Returns: []string{"legacy frontend configuration"}, Constraints: []string{"Agents must use gateway proxy routes and must not use this response to call providers directly.", "Requires a valid access_token via Authorization: Bearer when token issuance is enabled."},
 			},
 		},
-		Issuer: agentHelpEndpoint{Path: "/auth/token", Method: "POST", Purpose: "Trusted-server-only short-lived browser/API token issuance.", Cache: "no-store", Parameters: []agentHelpParameter{{Name: "X-Map-Gateway-Issuer-Key", Required: true, Format: "request header; long-lived shared issuer key"}}, Returns: []string{"access_token", "expires_at", "token_type"}, Constraints: []string{"No CORS.", "Only works after MAP_ACCESS_TOKEN_SECRET and MAP_TOKEN_ISSUER_KEY are configured on Raven.", "Never expose the issuer key to a browser."}},
+		Issuer: agentHelpEndpoint{Path: "/auth/token", Method: "POST", Purpose: "Trusted-server-only short-lived browser/API token issuance.", Cache: "no-store", Parameters: []agentHelpParameter{{Name: "X-Map-Gateway-Issuer-Key", Required: true, Format: "request header; long-lived shared issuer key"}}, Returns: []string{"access_token", "expires_at", "token_type"}, Constraints: []string{"No CORS.", "Only works after MAP_ACCESS_TOKEN_SECRET and MAP_TOKEN_ISSUER_KEY are configured on Raven.", "Never expose the issuer key to a browser.", "Tokens are valid for 10 minutes from issuance; re-issue before expiry."}},
 		Admin: []agentHelpEndpoint{
 			{Path: "/admin", Method: "GET", Purpose: "Human administration UI; not for agent integration.", Cache: "no-store", Returns: []string{"HTML; authenticated session required"}},
 			{Path: "/admin/login", Method: "POST", Purpose: "Administration session login; not for agent integration.", Cache: "no-store", Returns: []string{"session cookie"}},
@@ -659,7 +660,7 @@ func (g *gateway) handleAgentHelp(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	if g.accessControlEnabled() {
-		help.AccessControl = "enabled: data routes require a valid short-lived access_token query parameter or Authorization: Bearer token; /help and health probes remain open"
+		help.AccessControl = "enabled: data routes require a valid access_token (10-minute validity). Tiles accept ?access_token= or Authorization: Bearer; data APIs (/geocode, /search, /resolve, /cfg/maps) require Authorization: Bearer only — access_token as a query parameter is rejected by strict parameter validation. /help and /health remain open."
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
