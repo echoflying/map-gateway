@@ -126,6 +126,8 @@ type config struct {
 	// Admin dashboard (fixed credential).
 	AdminUser string
 	AdminPass string
+	// Bandwidth ceiling in Mbps for bottleneck judgement; 0 means unknown.
+	BandwidthMBPS int
 	// Upstream base URLs, overridable mainly for tests / mirrors.
 	TerrainUpstream  string
 	SatUpstream      string
@@ -195,6 +197,11 @@ func configFromEnv() config {
 	if v := get("MAP_TILE_RATE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.TileRate = n
+		}
+	}
+	if v := get("MAP_BANDWIDTH_MBPS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.BandwidthMBPS = n
 		}
 	}
 	if v := get("MAP_UPSTREAM_TIMEOUT"); v != "" {
@@ -270,6 +277,16 @@ type statsSnapshot struct {
 	ByApp       map[string]*epStat `json:"byApp"`
 	RecentErr   []errRec           `json:"recentErrors"`
 	MinuteHist  []minuteRec        `json:"minuteHistory"`
+	// Bottleneck telemetry (live, refreshed each second).
+	BytesPerSec    float64 `json:"bytesPerSec"`
+	PeakBytesSec   float64 `json:"peakBytesPerSec"`
+	ActiveReqs     int64   `json:"activeReqs"`
+	CPUPct         float64 `json:"cpuPct"`
+	BandwidthPct   float64 `json:"bandwidthPct"` // -1 = no ceiling configured
+	UpstreamErrPct float64 `json:"upstreamErrPct"`
+	LatencyP50     float64 `json:"latencyP50"`
+	LatencyP95     float64 `json:"latencyP95"`
+	Verdict        string  `json:"verdict"`
 }
 
 type epStat struct {
@@ -323,6 +340,7 @@ type gateway struct {
 	// Runtime statistics (backend of /admin/api/stats).
 	statsMu       sync.Mutex
 	statsStart    time.Time
+	latSamples    []float64        // guarded by statsMu; request latency in ms
 	reqTotal      atomic.Int64
 	cacheHit      atomic.Int64
 	cacheMiss     atomic.Int64
@@ -330,6 +348,14 @@ type gateway struct {
 	upstreamErr   atomic.Int64
 	rateLimited   atomic.Int64
 	bytesOut      atomic.Int64
+	// Bottleneck telemetry: live outbound bytes/sec, active requests and
+	// host CPU utilisation, refreshed once per second by monitorLoop.
+	// Float values are stored as int64 (cpuPct is percent*10; curBPS/peakBPS
+	// are integer bytes per second) because Red Hat Go lacks atomic.Float64.
+	curBPS     atomic.Int64
+	peakBPS    atomic.Int64
+	activeReqs atomic.Int64
+	cpuPct     atomic.Int64
 	byEndpoint    map[string]*epStat // guarded by statsMu
 	byApp         map[string]*epStat // guarded by statsMu
 	recentErr     []errRec           // guarded by statsMu
@@ -364,6 +390,7 @@ func newGateway(cfg config) *gateway {
 		log.Printf("cache dir %s: %v", cfg.CacheDir, err)
 	}
 	g.initCacheSize()
+	go g.monitorLoop()
 	return g
 }
 
@@ -376,6 +403,72 @@ func (g *gateway) initCacheSize() {
 		}
 		return nil
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Bottleneck telemetry
+// ---------------------------------------------------------------------------
+
+// monitorLoop refreshes live bandwidth (bytes/sec) and host CPU utilisation
+// once per second. The dashboard compares these against the configured
+// bandwidth ceiling to separate "bandwidth saturated" from "compute bound".
+func (g *gateway) monitorLoop() {
+	last := g.bytesOut.Load()
+	for range time.Tick(time.Second) {
+		cur := g.bytesOut.Load()
+		bps := float64(cur - last)
+		last = cur
+		g.curBPS.Store(int64(math.Round(bps)))
+		if bps > float64(g.peakBPS.Load()) {
+			g.peakBPS.Store(int64(math.Round(bps)))
+		}
+		g.cpuPct.Store(int64(math.Round(systemCPUPercent() * 10)))
+	}
+}
+
+func readCPUTimes() (total, idle float64, ok bool) {
+	b, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, 0, false
+	}
+	lines := strings.SplitN(string(b), "\n", 2)
+	if len(lines) == 0 {
+		return 0, 0, false
+	}
+	parts := strings.Fields(lines[0])
+	if len(parts) < 5 || parts[0] != "cpu" {
+		return 0, 0, false
+	}
+	var fields []float64
+	for _, p := range parts[1:] {
+		if v, err := strconv.ParseFloat(p, 64); err == nil {
+			fields = append(fields, v)
+		}
+	}
+	if len(fields) < 4 {
+		return 0, 0, false
+	}
+	return fields[0] + fields[1] + fields[2] + fields[3], fields[3], true
+}
+
+// systemCPUPercent samples /proc/stat twice with a short gap and returns the
+// aggregate host CPU utilisation percentage (0..100).
+func systemCPUPercent() float64 {
+	t1, i1, ok1 := readCPUTimes()
+	if !ok1 {
+		return 0
+	}
+	time.Sleep(300 * time.Millisecond)
+	t2, i2, ok2 := readCPUTimes()
+	if !ok2 {
+		return 0
+	}
+	dt := t2 - t1
+	di := i2 - i1
+	if dt <= 0 {
+		return 0
+	}
+	return math.Round((1-di/dt)*1000) / 10
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +497,8 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 
 func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	g.activeReqs.Add(1)
+	defer g.activeReqs.Add(-1)
 	rec := &statusRecorder{ResponseWriter: w}
 	path := r.URL.Path
 	if path == "/auth/token" && r.Method == http.MethodPost {
@@ -2042,6 +2137,10 @@ func (g *gateway) recordRequest(path string, status int, bytes int64, dur time.D
 			g.recentErr = g.recentErr[len(g.recentErr)-50:]
 		}
 	}
+	g.latSamples = append(g.latSamples, float64(dur.Microseconds())/1000.0)
+	if len(g.latSamples) > 300 {
+		g.latSamples = g.latSamples[len(g.latSamples)-300:]
+	}
 	g.appendMinute(now, err)
 	g.statsMu.Unlock()
 }
@@ -2201,7 +2300,44 @@ func (g *gateway) snapshot() statsSnapshot {
 	copy(rerr, g.recentErr)
 	hist := make([]minuteRec, len(g.minuteHistory))
 	copy(hist, g.minuteHistory)
+	lat := make([]float64, len(g.latSamples))
+	copy(lat, g.latSamples)
 	g.statsMu.Unlock()
+
+	// Latency percentiles (ms) from the sample ring.
+	latP50, latP95 := 0.0, 0.0
+	if len(lat) > 0 {
+		sort.Float64s(lat)
+		pct := func(p float64) float64 { return lat[int(p*float64(len(lat)-1))] }
+		latP50 = pct(0.50)
+		latP95 = pct(0.95)
+	}
+
+	// Bottleneck judgement: bandwidth vs compute vs upstream vs load.
+	bwPct := -1.0
+	curBPS := float64(g.curBPS.Load())
+	cpuPct := float64(g.cpuPct.Load()) / 10
+	if g.cfg.BandwidthMBPS > 0 {
+		bwPct = math.Round(100*curBPS/float64(g.cfg.BandwidthMBPS*125000)*10) / 10
+	}
+	upErrPct := 0.0
+	if okUp := g.upstreamOK.Load() + g.upstreamErr.Load(); okUp > 0 {
+		upErrPct = math.Round(100*float64(g.upstreamErr.Load())/float64(okUp)*10) / 10
+	}
+	verdict := "运行正常"
+	active := g.activeReqs.Load()
+	switch {
+	case upErrPct > 10:
+		verdict = "⚠ 上游异常：上游错误率 " + strconv.FormatFloat(upErrPct, 'f', 1, 64) + "%（检查天地图/ArcGIS/AWS）"
+	case bwPct >= 80:
+		verdict = "⚠ 带宽瓶颈：出网已达带宽上限约 " + strconv.FormatFloat(bwPct, 'f', 0, 64) + "%（流量大，考虑扩容带宽或压缩瓦片）"
+	case cpuPct >= 80:
+		verdict = "⚠ 处理能力瓶颈：CPU " + strconv.FormatFloat(cpuPct, 'f', 0, 64) + "%（考虑加核或优化）"
+	case active >= 50 && latP95 > 2000:
+		verdict = "⚠ 访问量过大：并发堆积 " + strconv.FormatInt(active, 10) + " 且 P95 " + strconv.FormatFloat(latP95, 'f', 0, 64) + "ms（限流/扩容）"
+	case latP95 > 1000:
+		verdict = "⚠ 响应变慢：P95 " + strconv.FormatFloat(latP95, 'f', 0, 64) + "ms（先查带宽，再看上游）"
+	}
 
 	return statsSnapshot{
 		Start:       g.statsStart,
@@ -2216,6 +2352,15 @@ func (g *gateway) snapshot() statsSnapshot {
 		ByApp:       ap,
 		RecentErr:   rerr,
 		MinuteHist:  hist,
+		BytesPerSec:    math.Round(curBPS),
+		PeakBytesSec:   float64(g.peakBPS.Load()),
+		ActiveReqs:     active,
+		CPUPct:         cpuPct,
+		BandwidthPct:   bwPct,
+		UpstreamErrPct: upErrPct,
+		LatencyP50:     latP50,
+		LatencyP95:     latP95,
+		Verdict:        verdict,
 	}
 }
 
@@ -2528,6 +2673,18 @@ const adminDashboardPage = `<!doctype html>
 </div>
 <div class="meta">版本 <span id="ver">-</span> · 启动时间 <span id="start">-</span> · 运行时长 <span id="uptime">-</span> · 缓存上限 <span id="cap">-</span> · 刷新间隔 5s</div>
 
+<div class="panel" id="healthpanel">
+  <h2>健康速览 · 当前瓶颈判定</h2>
+  <div id="verdict" style="font-size:20px;font-weight:700;margin-bottom:12px;">检测中…</div>
+  <div class="cards">
+    <div class="card"><div class="n" id="h_bw">-</div><div class="l">带宽压力（出网/上限）</div></div>
+    <div class="card"><div class="n" id="h_cpu">-</div><div class="l">CPU 使用率</div></div>
+    <div class="card"><div class="n" id="h_conc">-</div><div class="l">并发活跃请求</div></div>
+    <div class="card"><div class="n" id="h_p95">-</div><div class="l">请求时延 P95</div></div>
+  </div>
+  <div class="meta">出网实时 <span id="h_bps">-</span> · 峰值出网 <span id="h_peak">-</span> · 上游错误率 <span id="h_uerr">-</span> · 限流累计 <span id="h_rl">-</span> · 时延 P50 <span id="h_p50">-</span></div>
+</div>
+
 <div class="cards">
   <div class="card"><div class="n" id="c_total">0</div><div class="l">总请求数</div></div>
   <div class="card ok"><div class="n" id="c_hitrate">0%</div><div class="l">缓存命中率</div></div>
@@ -2577,6 +2734,7 @@ const adminDashboardPage = `<!doctype html>
 function esc(s){return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function fmtMB(b){return b>=1e6?(b/1e6).toFixed(1):b+'B';}
 function fmtDur(ms){if(ms>=1000)return (ms/1000).toFixed(1)+'s';return ms+'ms';}
+function fmtRate(b){if(b>=1e6)return (b/1e6).toFixed(2)+'MB/s';if(b>=1e3)return (b/1e3).toFixed(1)+'KB/s';return Math.round(b)+'B/s';}
 function draw(data){
   var hist = data.stats.minuteHistory || [];
   var max = 1;
@@ -2619,6 +2777,22 @@ function refresh(){
     document.getElementById('c_cachemb').textContent=d.cacheSizeMB||0;
     document.getElementById('c_rate').textContent=s.rateLimited||0;
     document.getElementById('c_err').textContent=s.upstreamErrors||0;
+    // Health snapshot: first-glance bottleneck judgement.
+    var vd=document.getElementById('verdict');
+    if(s.verdict){ vd.textContent=s.verdict;
+      if(s.verdict.indexOf('正常')>=0){ vd.style.color='var(--ok)'; }
+      else if(s.verdict.indexOf('上游')>=0){ vd.style.color='var(--warn)'; }
+      else { vd.style.color='var(--bad)'; }
+    }
+    document.getElementById('h_bw').textContent = (s.bandwidthPct!=null && s.bandwidthPct>=0) ? s.bandwidthPct+'%' : 'N/A';
+    document.getElementById('h_cpu').textContent = (s.cpuPct!=null?s.cpuPct:0)+'%';
+    document.getElementById('h_conc').textContent = s.activeReqs||0;
+    document.getElementById('h_p95').textContent = s.latencyP95!=null?fmtDur(s.latencyP95):'-';
+    document.getElementById('h_p50').textContent = s.latencyP50!=null?fmtDur(s.latencyP50):'-';
+    document.getElementById('h_bps').textContent = fmtRate(s.bytesPerSec||0);
+    document.getElementById('h_peak').textContent = fmtRate(s.peakBytesPerSec||0);
+    document.getElementById('h_uerr').textContent = (s.upstreamErrPct!=null?s.upstreamErrPct:0)+'%';
+    document.getElementById('h_rl').textContent = s.rateLimited||0;
     draw(d);
     var ab=document.getElementById('app_body'); ab.innerHTML='';
     var apps=s.byApp||{};
